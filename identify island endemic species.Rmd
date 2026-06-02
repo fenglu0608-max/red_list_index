@@ -1,0 +1,550 @@
+---
+title: "species categories method"
+author: "LU FENG"
+date: "2026-05-06"
+output: html_document
+---
+# Main purpose:
+# This script identifies bird species whose native extant ranges occur only on islands and continent
+# by overlaying BirdLife range maps with global island and mainland polygons.
+
+# Input data:
+# 1. BirdLife BOTW_2025.gpkg range maps
+# 2. USGS Global Islands geodatabase, including islands and mainlands
+
+# Output:
+# species-level island and mainland overlap areas;
+# island-only, mainland-only, and island-mainland shared classification;
+# diagnostic table for species whose area calculation failed.
+
+```{r package}
+# 1. Load required packages and set spatial processing options
+
+library(sf)
+library(dplyr)
+library(data.table)
+library(lwgeom)
+
+# Skip GDAL polygon organization to speed up reading complex polygon data
+Sys.setenv(OGR_ORGANIZE_POLYGONS = "SKIP")
+
+# Use planar geometry because all area calculations are done in an equal-area CRS.
+sf_use_s2(FALSE)
+
+# Print warnings immediately
+options(warn = 1)
+
+```
+
+
+```{r paths-and-parameters}
+project_dir <- path.expand("~/island_bird_project")
+# Main project directory
+
+bird_path  <- file.path(project_dir, "BOTW_2025.gpkg")
+island_gdb <- file.path(project_dir, "GlbIslands.gdb")
+out_dir    <- file.path(project_dir, "output")
+chunk_out_dir <- file.path(out_dir, "chunks")
+# Output folder for each SLURM array chunk
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(chunk_out_dir, showWarnings = FALSE, recursive = TRUE)
+# Create output folders if they do not exist
+
+# Equal-area projection used for area calculation
+# EPSG:6933 = World Cylindrical Equal Area
+equal_area_crs <- 6933
+```
+
+```{r BirdLife filters and SLURM settings, include=FALSE}
+# Keep only extant ranges
+presence_keep <- c(1)
+# keep only native ranges
+origin_keep   <- c(1)
+# keep only breeding and resident ranges
+seasonal_keep <- c(1, 2)
+
+# Mainland overlap tolerance in km2.
+# Species with mainland overlap <= this threshold are still treated as island-only.
+mainland_tol_km2 <- 1
+
+# Divide the analysis into different tasks to speed up the operation
+# Current SLURM array task ID
+array_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+# Number of species processed by each array job
+species_per_job <- as.integer(Sys.getenv("SPECIES_PER_JOB", "100"))
+# Number of species processed in each spatial chunk
+chunk_size <- as.integer(Sys.getenv("CHUNK_SIZE", "10"))
+```
+
+```{r check paramters valid, include=FALSE}
+
+# Calculate the SQL offset for this array job
+# This determines which subset of species will be processed
+offset_n <- (array_id - 1) * species_per_job
+job_label <- sprintf("job%03d", array_id)
+
+# Helper function to print timestamped log messages
+# This is useful for monitoring long-running jobs on the cluster
+log_msg <- function(...) {
+  message(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", ...)
+}
+
+# SQL filter for BirdLife range polygons
+bird_where <- paste0(
+  "presence IN (", paste(presence_keep, collapse = ","), ") ",
+  "AND origin IN (", paste(origin_keep, collapse = ","), ") ",
+  "AND seasonal IN (", paste(seasonal_keep, collapse = ","), ")"
+)
+
+#Inner query: determines which 100 species are assigned to the current array job
+#Outer query: reads all BirdLife range polygons for those 100 selected species
+bird_query <- paste0("
+  SELECT sisid, sci_name, presence, origin, seasonal, geom
+  FROM all_species
+  WHERE ", bird_where, "
+    AND sisid IN (
+      SELECT sisid FROM (
+        SELECT DISTINCT sisid
+        FROM all_species
+        WHERE ", bird_where, "
+        ORDER BY sisid
+        LIMIT ", species_per_job, "
+        OFFSET ", offset_n, "
+      )
+    )
+")
+
+log_msg("Reading BirdLife data...")
+```
+
+```{r read and clean birdlife data, include=FALSE}
+
+# Read BirdLife polygons for this array job
+birds_features <- st_read(
+  dsn = bird_path,
+  query = bird_query,
+  quiet = FALSE
+)
+
+# This species was skipped because it takes extremely long to process.
+skip_sisid <- c(22680405)
+
+birds_features <- birds_features %>%
+  filter(!(sisid %in% skip_sisid))
+
+# If no species are assigned to this job, stop the script
+if (nrow(birds_features) == 0) {
+  log_msg("No BirdLife features assigned to this array job. Exiting.")
+  quit(save = "no", status = 0)
+}
+
+# Remove empty geometries
+birds_features <- birds_features[!st_is_empty(birds_features), ]
+
+# Repair invalid geometries and transform to equal-area projection
+birds_features <- birds_features %>%
+  st_make_valid() %>%
+  st_transform(equal_area_crs)
+```
+
+
+
+```{r Dissolve polygons by species, include=FALSE}
+
+# Read BirdLife polygons for this array job
+log_msg("Dissolving bird ranges by species...")
+
+#BirdLife may contain multiple polygons for the same species.
+#This function combines all polygons belonging to one species into a single geometry.
+
+dissolve_species <- function(x) {
+  #Extract species ID and scientific name
+  sid <- x$sisid[1]
+  sname <- x$sci_name[1]
+  
+  # Remove empty geometries
+  x <- x[!st_is_empty(x), ]
+  
+  # If all geometries of this species are empty, skip this species
+  if (nrow(x) == 0) return(NULL)
+  
+  # Repair geometries before union
+  x <- st_make_valid(x)
+  
+  # First attempt: dissolve polygons using st_union
+  g <- tryCatch(
+    st_union(st_geometry(x)),
+    error = function(e) NULL
+  )
+  
+  # Fallback: buffer(0) sometimes repairs topology problems
+  if (is.null(g)) {
+    x2 <- tryCatch(st_buffer(x, 0), error = function(e) NULL)
+    if (!is.null(x2)) {
+      g <- tryCatch(
+        st_union(st_geometry(st_make_valid(x2))),
+        error = function(e) NULL
+      )
+    }
+  }
+  
+  # Fallback 2: if union fails, use st_combine
+  if (is.null(g)) {
+        g <- tryCatch(st_combine(st_geometry(x)), error = function(e) NULL)
+        }
+  if (is.null(g)) return(NULL)
+  g <- st_make_valid(g)
+  
+  # Area calculations require polygon geometries.
+  if (!inherits(g, "sfc_POLYGON") && !inherits(g, "sfc_MULTIPOLYGON")) {
+    g <- st_collection_extract(g, "POLYGON")
+  }
+  
+  #Remove empty geometries after extraction or validation.
+  g <- g[!st_is_empty(g)]
+  if (length(g) == 0) return(NULL)
+  
+# If the result contains multiple geometry features, combine them so that
+# each species is represented by a single geometry object.
+  
+if (length(g) > 1) {
+    g <- st_make_valid(st_combine(g))
+  }
+  st_sf(
+    sisid = sid,
+    sci_name = sname,
+    geometry = g,
+    crs = st_crs(x)
+  )
+}
+
+# Split BirdLife range polygons by species ID (sisid)..
+
+birds_species <- split(birds_features, birds_features$sisid) %>%
+  lapply(dissolve_species) %>%
+  Filter(Negate(is.null), .) %>%
+  do.call(rbind, .) %>%
+  st_make_valid()
+
+# Total range size is calculated after dissolving each species.
+birds_species$total_range_area_km2 <- as.numeric(st_area(birds_species)) / 1e6
+log_msg("Species after dissolve: ", nrow(birds_species))
+
+# Remove large intermediate objects to free memory.
+rm(birds_features)
+gc()
+
+```
+
+```{r Read island and mainland layers, include=FALSE}
+
+# Read only geometry because attribute columns are not needed here.
+read_geom_only <- function(gdb, layer_name) {
+  x <- st_read(gdb, layer = layer_name, quiet = FALSE)
+  st_sf(geometry = st_geometry(x), crs = st_crs(x))
+}
+
+# Read island layers of different size classes
+big_islands <- read_geom_only(island_gdb, "BigIslands")
+small_islands <- read_geom_only(island_gdb, "SmallIslands")
+very_small_islands <- read_geom_only(island_gdb, "VerySmallIslands")
+mainlands <- read_geom_only(island_gdb, "Mainlands")
+
+# Combine all island layers into one island dataset
+islands <- bind_rows(big_islands, small_islands, very_small_islands)
+
+# Remove empty island geometries and transform to equal-area projection
+islands <- islands[!st_is_empty(islands), ]
+
+islands <- islands %>%
+   st_make_valid() %>%
+  st_transform(equal_area_crs)
+
+mainlands <- mainlands[!st_is_empty(mainlands), ]
+
+mainlands <- mainlands %>%
+  st_make_valid() %>%
+  st_transform(equal_area_crs)
+
+rm(big_islands, small_islands, very_small_islands)
+gc()
+
+log_msg("Island polygons: ", nrow(islands))
+log_msg("Mainland polygons: ", nrow(mainlands))
+```
+
+```{r Checking mainland intersections, include=FALSE}
+# This function checks whether each species range intersects a spatial mask.
+# The mask can be islands or mainlands.
+# The operation is performed in chunks to reduce memory use.
+
+intersection_flag <- function(species_sf, mask_sf, flag_name) {
+  # Split species into chunks
+  idx <- split(
+    seq_len(nrow(species_sf)),
+    ceiling(seq_len(nrow(species_sf)) / chunk_size)
+  )
+  
+  # For each chunk, check spatial intersection
+  out <- lapply(seq_along(idx), function(i) {
+    log_msg("Checking ", flag_name, " chunk ", i, " / ", length(idx))
+    
+    x <- species_sf[idx[[i]], ]
+    
+    data.frame(
+      sisid = x$sisid,
+      
+      # TRUE if the species intersects at least one polygon in the mask
+      flag = lengths(st_intersects(x, mask_sf)) > 0
+    )
+  }) %>%
+    bind_rows()
+  # Rename output column
+  names(out)[names(out) == "flag"] <- flag_name
+  out
+}
+
+log_msg("Checking island intersections...")
+
+# Check whether species ranges overlap islands
+island_flag <- intersection_flag(birds_species, islands, "island_overlap")
+# Check whether species ranges overlap mainlands
+mainland_flag <- intersection_flag(birds_species, mainlands, "mainland_overlap")
+```
+
+```{r Calculate mainland overlap area}
+# Calculate mainland overlap area for mainland-touching species
+
+# This function calculates the total area of overlap between each species range
+  # and a given mask layer.
+  #
+  # species_sf  = dissolved species range polygons
+  # mask_sf     = island polygons or mainland polygons
+  # overlap_ids = species IDs that have at least one spatial intersection
+  # area_name   = output area column name, e.g. "island_area_km2"
+  # status_name = output status column name, e.g. "island_area_status"
+
+calc_overlap_area <- function(species_sf, mask_sf, overlap_ids, area_name, status_name) {
+  base <- species_sf %>%
+    st_drop_geometry() %>%
+    distinct(sisid)
+  xall <- species_sf %>%
+    filter(sisid %in% overlap_ids)
+  # This does not mean there are no input species.
+  # It means none of the species in this array job overlaps the current mask
+  # layer, such as islands or mainlands. In that case, all species get zero
+  # overlap area for this mask.
+  if (nrow(xall) == 0) {
+    out <- base %>%
+      mutate(
+        area_km2 = 0,
+        area_status = "absent"
+      )
+    names(out)[names(out) == "area_km2"] <- area_name
+    names(out)[names(out) == "area_status"] <- status_name
+    return(out)
+  }
+  idx <- split(
+    seq_len(nrow(xall)),
+    ceiling(seq_len(nrow(xall)) / chunk_size)
+  )
+  area_hit <- lapply(seq_along(idx), function(i) {
+    log_msg("Calculating ", area_name, " chunk ", i, " / ", length(idx))
+    x <- xall[idx[[i]], ]
+    # Keep only mask polygons that intersect this species chunk.
+    mask_ids <- unique(unlist(st_intersects(x, mask_sf)))
+    if (length(mask_ids) == 0) {
+      return(data.frame(
+        sisid = x$sisid,
+        area_km2 = 0,
+        area_status = "absent"
+      ))
+    }
+    # Calculate the actual geometric overlap.
+    inter <- tryCatch(
+      st_intersection(st_make_valid(x), mask_sf[mask_ids, ]),
+      error = function(e) NULL
+    )
+    # If the area calculation fails, keep it as NA instead of treating it as zero.
+    if (is.null(inter)) {
+      return(data.frame(
+        sisid = x$sisid,
+        area_km2 = NA_real_,
+        area_status = "area_failed"
+      ))
+    }
+    # Keep only polygon overlaps.
+    # Boundary-only contacts may produce points or lines, which should not count as area.
+    inter <- st_collection_extract(inter, "POLYGON")
+    inter <- inter[!st_is_empty(inter), ]
+    if (nrow(inter) == 0) {
+      return(data.frame(
+        sisid = x$sisid,
+        area_km2 = 0,
+        area_status = "absent"
+      ))
+    }
+    inter %>%
+      mutate(area_km2 = as.numeric(st_area(.)) / 1e6) %>%
+      st_drop_geometry() %>%
+      group_by(sisid) %>%
+      summarise(
+        area_km2 = sum(area_km2, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(area_status = "present")
+  }) %>%
+    bind_rows() %>%
+    group_by(sisid) %>%
+    summarise(
+      area_km2 = ifelse(any(is.na(area_km2)), NA_real_, sum(area_km2, na.rm = TRUE)),
+      area_status = case_when(
+        any(is.na(area_km2)) ~ "area_failed",
+        sum(area_km2, na.rm = TRUE) > 0 ~ "present",
+        TRUE ~ "absent"
+      ),
+      .groups = "drop"
+    )
+  # Add back species with no overlap.
+  out <- base %>%
+    left_join(area_hit, by = "sisid") %>%
+    mutate(
+          area_km2 = ifelse(is.na(area_km2) & is.na(area_status), 0, area_km2),
+          area_status = ifelse(is.na(area_status), "absent", area_status)
+          )
+  names(out)[names(out) == "area_km2"] <- area_name
+  names(out)[names(out) == "area_status"] <- status_name
+  out
+}
+
+# Run the mainland&islands area calculation for species that intersect mainland and islands polygons.
+log_msg("Calculating island overlap area...")
+
+island_area <- calc_overlap_area(
+  species_sf = birds_species,
+  mask_sf = islands,
+  overlap_ids = island_flag %>% filter(island_overlap) %>% pull(sisid),
+  area_name = "island_area_km2",
+  status_name = "island_area_status"
+)
+rm(islands)
+gc()
+
+log_msg("Calculating mainland overlap area...")
+mainland_area <- calc_overlap_area(
+  species_sf = birds_species,
+  mask_sf = mainlands,
+  overlap_ids = mainland_flag %>% filter(mainland_overlap) %>% pull(sisid),
+  area_name = "mainland_area_km2",
+  status_name = "mainland_area_status"
+)
+rm(mainlands)
+gc()
+```
+
+```{r Classify species as island-only or non-island-only}
+log_msg("Classifying species...")
+
+species_result <- birds_species %>%
+  st_drop_geometry() %>%
+  select(sisid, sci_name, total_range_area_km2) %>%
+  left_join(island_flag, by = "sisid") %>%
+  left_join(mainland_flag, by = "sisid") %>%
+  left_join(island_area, by = "sisid") %>%
+  left_join(mainland_area, by = "sisid") %>%
+  mutate(
+     # If no overlap information is available, treat as FALSE
+    island_overlap = ifelse(is.na(island_overlap), FALSE, island_overlap),
+    mainland_overlap = ifelse(is.na(mainland_overlap), FALSE, mainland_overlap),
+    
+    island_area_km2 = ifelse(is.na(island_area_km2) & !island_overlap, 0, island_area_km2),
+    mainland_area_km2 = ifelse(is.na(mainland_area_km2) & !mainland_overlap, 0, mainland_area_km2),
+
+    island_area_prop = island_area_km2 / total_range_area_km2,
+    mainland_area_prop = mainland_area_km2 / total_range_area_km2,
+
+    island_area_prop = ifelse(is.infinite(island_area_prop), NA_real_, island_area_prop),
+    mainland_area_prop = ifelse(is.infinite(mainland_area_prop), NA_real_, mainland_area_prop),
+
+    mainland_area_status_for_classification = case_when(
+      is.na(mainland_area_km2) ~ "area_failed",
+      mainland_area_km2 <= mainland_tol_km2 ~ "within_tolerance",
+      TRUE ~ "above_tolerance"
+    ),
+
+    island_only_binary_strict = island_overlap & !mainland_overlap,
+    island_only_area_based = island_overlap &
+      mainland_area_status_for_classification == "within_tolerance",
+    island_only = island_only_area_based
+  ) %>%
+  arrange(desc(island_only), mainland_area_status_for_classification, mainland_area_km2, sci_name)
+
+island_only_species <- species_result %>%
+  filter(island_only)
+
+area_failed_species <- species_result %>%
+  filter(
+    island_area_status == "area_failed" |
+      mainland_area_status == "area_failed" |
+      mainland_area_status_for_classification == "area_failed"
+  )
+```
+
+```{r Write output tables, range maps, and parameter summaries}
+fwrite(
+  species_result,
+  file.path(chunk_out_dir, paste0("all_species_same_method_", job_label, ".csv"))
+)
+
+fwrite(
+  island_only_species,
+  file.path(chunk_out_dir, paste0("island_only_species_same_method_", job_label, ".csv"))
+)
+
+fwrite(
+  area_failed_species,
+  file.path(chunk_out_dir, paste0("area_failed_species_same_method_", job_label, ".csv"))
+)
+
+parameter_summary <- data.frame(
+  parameter = c(
+    "presence_keep",
+    "origin_keep",
+    "seasonal_keep",
+    "mainland_tol_km2",
+    "equal_area_crs",
+    "array_id",
+    "species_per_job",
+    "offset_n",
+    "chunk_size",
+    "n_species_analyzed",
+    "n_island_only_candidates",
+    "n_area_failed",
+    "classification_rule"
+  ),
+  value = c(
+    paste(presence_keep, collapse = ","),
+    paste(origin_keep, collapse = ","),
+    paste(seasonal_keep, collapse = ","),
+    mainland_tol_km2,
+    equal_area_crs,
+    array_id,
+    species_per_job,
+    offset_n,
+    chunk_size,
+    nrow(species_result),
+    nrow(island_only_species),
+    nrow(area_failed_species),
+    "island_overlap == TRUE and mainland_area_status_for_classification == within_tolerance"
+  )
+)
+
+fwrite(
+  parameter_summary,
+  file.path(chunk_out_dir, paste0("analysis_parameters_same_method_", job_label, ".csv"))
+)
+
+log_msg("Analysis finished.")
+log_msg("Output folder: ", chunk_out_dir)
+```
