@@ -1,0 +1,475 @@
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ============================================================
+# Threshold diagnostics for island/mainland species classification
+# ============================================================
+#
+# Purpose:
+# These plots are exploratory checks for choosing area and proportion
+# thresholds in island/mainland classification.
+#
+# Key idea:
+#   Island-side threshold check:
+#     x = mainland overlap area
+#     y = proportion of terrestrial range on true islands
+#
+#   Mainland-side threshold check:
+#     x = true-island overlap area
+#     y = proportion of terrestrial range on mainland
+#
+# A good threshold should separate a dense obvious cluster from a small
+# group of boundary or outlier species that may need manual checking.
+# ============================================================
+
+input_dir <- "/Users/fenglu/Downloads/global_island_filter_stratified_chunks"
+out_dir <- file.path(input_dir, "threshold_diagnostics")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+species_file <- file.path(input_dir, "all_species_island_stratified_area_combined.csv")
+species <- fread(species_file)
+
+area_thresholds <- c(1, 10, 100)
+prop_thresholds <- c(0.90, 0.95, 0.99)
+
+class_levels <- c(
+  "Strict island-endemic",
+  "Island-dominant",
+  "Island-mainland shared",
+  "Mainland-dominant",
+  "Strict mainland species",
+  "No terrestrial overlap",
+  "Ambiguous / check manually",
+  "area_failed"
+)
+
+class_cols <- c(
+  "Strict island-endemic" = "#0072B2",
+  "Island-dominant" = "#56B4E9",
+  "Island-mainland shared" = "#CC79A7",
+  "Mainland-dominant" = "#E69F00",
+  "Strict mainland species" = "#D55E00",
+  "No terrestrial overlap" = "grey55",
+  "Ambiguous / check manually" = "grey25",
+  "area_failed" = "black"
+)
+
+plot_dat <- species %>%
+  mutate(
+    land_distribution_class = factor(
+      land_distribution_class,
+      levels = class_levels
+    ),
+    log_mainland_area = log10(mainland_area_km2 + 1),
+    log_true_island_area = log10(true_island_area_km2 + 1),
+    has_terrestrial_overlap = land_area_km2 > 0 & !is.na(land_area_km2)
+  )
+
+axis_area_breaks <- c(0, 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000)
+axis_area_breaks_log <- log10(axis_area_breaks + 1)
+axis_area_labels <- c("0", "1", "10", "100", "1k", "10k", "100k", "1M", "10M", "100M")
+
+threshold_line_data <- data.frame(
+  threshold = area_thresholds,
+  threshold_log = log10(area_thresholds + 1)
+)
+
+prop_line_data <- data.frame(
+  threshold = prop_thresholds
+)
+
+base_theme <- theme_classic(base_size = 14) +
+  theme(
+    axis.text = element_text(colour = "black", size = 12),
+    axis.title = element_text(colour = "black", size = 14),
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(colour = "black", size = 10),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0),
+    plot.subtitle = element_text(size = 11, colour = "black"),
+    strip.text = element_text(face = "bold", size = 12, colour = "black"),
+    plot.margin = margin(6, 12, 6, 6)
+  )
+
+save_plot <- function(plot, filename, width = 7, height = 5) {
+  ggsave(
+    file.path(out_dir, paste0(filename, ".png")),
+    plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+  ggsave(
+    file.path(out_dir, paste0(filename, ".pdf")),
+    plot,
+    width = width,
+    height = height
+  )
+}
+
+# ------------------------------------------------------------
+# 1. Island-side diagnostic
+# ------------------------------------------------------------
+
+island_diag_dat <- plot_dat %>%
+  filter(has_terrestrial_overlap, true_island_area_km2 > 0)
+
+p_island <- ggplot(
+  island_diag_dat,
+  aes(
+    x = log_mainland_area,
+    y = true_island_prop_land,
+    colour = land_distribution_class
+  )
+) +
+  geom_point(alpha = 0.38, size = 1.2) +
+  geom_vline(
+    data = threshold_line_data,
+    aes(xintercept = threshold_log),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  geom_hline(
+    data = prop_line_data,
+    aes(yintercept = threshold),
+    inherit.aes = FALSE,
+    linetype = "dotted",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  annotate(
+    "text",
+    x = threshold_line_data$threshold_log,
+    y = 0.02,
+    label = paste0(threshold_line_data$threshold, " km2"),
+    angle = 90,
+    vjust = -0.35,
+    hjust = 0,
+    size = 3.2,
+    colour = "black"
+  ) +
+  annotate(
+    "text",
+    x = max(axis_area_breaks_log) * 0.98,
+    y = prop_thresholds,
+    label = paste0(prop_thresholds * 100, "%"),
+    hjust = 1,
+    vjust = -0.35,
+    size = 3.2,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    breaks = axis_area_breaks_log,
+    labels = axis_area_labels
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    labels = percent_format(accuracy = 1)
+  ) +
+  scale_colour_manual(values = class_cols, drop = FALSE) +
+  labs(
+    x = "Mainland overlap area (km2, log10 area + 1)",
+    y = "Proportion of terrestrial range on true islands",
+    title = "Island-side threshold diagnostic",
+    subtitle = "Good island-endemic thresholds should isolate points near the top-left corner"
+  ) +
+  base_theme
+
+save_plot(p_island, "01_island_side_area_proportion_thresholds", width = 8.8, height = 5.6)
+
+# ------------------------------------------------------------
+# 2. Mainland-side diagnostic
+# ------------------------------------------------------------
+
+mainland_diag_dat <- plot_dat %>%
+  filter(has_terrestrial_overlap, mainland_area_km2 > 0)
+
+p_mainland <- ggplot(
+  mainland_diag_dat,
+  aes(
+    x = log_true_island_area,
+    y = mainland_prop_land,
+    colour = land_distribution_class
+  )
+) +
+  geom_point(alpha = 0.38, size = 1.2) +
+  geom_vline(
+    data = threshold_line_data,
+    aes(xintercept = threshold_log),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  geom_hline(
+    data = prop_line_data,
+    aes(yintercept = threshold),
+    inherit.aes = FALSE,
+    linetype = "dotted",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  annotate(
+    "text",
+    x = threshold_line_data$threshold_log,
+    y = 0.02,
+    label = paste0(threshold_line_data$threshold, " km2"),
+    angle = 90,
+    vjust = -0.35,
+    hjust = 0,
+    size = 3.2,
+    colour = "black"
+  ) +
+  annotate(
+    "text",
+    x = max(axis_area_breaks_log) * 0.98,
+    y = prop_thresholds,
+    label = paste0(prop_thresholds * 100, "%"),
+    hjust = 1,
+    vjust = -0.35,
+    size = 3.2,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    breaks = axis_area_breaks_log,
+    labels = axis_area_labels
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    labels = percent_format(accuracy = 1)
+  ) +
+  scale_colour_manual(values = class_cols, drop = FALSE) +
+  labs(
+    x = "True-island overlap area (km2, log10 area + 1)",
+    y = "Proportion of terrestrial range on mainland",
+    title = "Mainland-side threshold diagnostic",
+    subtitle = "Good mainland thresholds should isolate points near the top-left corner"
+  ) +
+  base_theme
+
+save_plot(p_mainland, "02_mainland_side_area_proportion_thresholds", width = 8.8, height = 5.6)
+
+# ------------------------------------------------------------
+# 3. Island area versus mainland area
+# ------------------------------------------------------------
+
+p_area_area <- ggplot(
+  plot_dat %>% filter(has_terrestrial_overlap),
+  aes(
+    x = log_mainland_area,
+    y = log_true_island_area,
+    colour = land_distribution_class
+  )
+) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "solid",
+    linewidth = 0.25,
+    colour = "grey55"
+  ) +
+  geom_point(alpha = 0.35, size = 1.1) +
+  geom_vline(
+    data = threshold_line_data,
+    aes(xintercept = threshold_log),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  geom_hline(
+    data = threshold_line_data,
+    aes(yintercept = threshold_log),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.35,
+    colour = "grey35"
+  ) +
+  scale_x_continuous(
+    breaks = axis_area_breaks_log,
+    labels = axis_area_labels
+  ) +
+  scale_y_continuous(
+    breaks = axis_area_breaks_log,
+    labels = axis_area_labels
+  ) +
+  scale_colour_manual(values = class_cols, drop = FALSE) +
+  labs(
+    x = "Mainland overlap area (km2, log10 area + 1)",
+    y = "True-island overlap area (km2, log10 area + 1)",
+    title = "Island and mainland overlap areas",
+    subtitle = "The diagonal indicates equal island and mainland overlap area"
+  ) +
+  base_theme
+
+save_plot(p_area_area, "03_island_area_vs_mainland_area", width = 7.2, height = 5.8)
+
+# ------------------------------------------------------------
+# 4. Sensitivity of species counts to area and proportion thresholds
+# ------------------------------------------------------------
+
+sensitivity <- expand.grid(
+  area_threshold_km2 = area_thresholds,
+  prop_threshold = prop_thresholds,
+  group = c("Island-side", "Mainland-side")
+) %>%
+  as_tibble() %>%
+  rowwise() %>%
+  mutate(
+    n_species = ifelse(
+      group == "Island-side",
+      sum(
+        species$true_island_area_km2 > 0 &
+          species$mainland_area_km2 <= area_threshold_km2 &
+          species$true_island_prop_land >= prop_threshold &
+          !species$any_area_failed,
+        na.rm = TRUE
+      ),
+      sum(
+        species$mainland_area_km2 > 0 &
+          species$true_island_area_km2 <= area_threshold_km2 &
+          species$mainland_prop_land >= prop_threshold &
+          !species$any_area_failed,
+        na.rm = TRUE
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    area_threshold_label = paste0(area_threshold_km2, " km2"),
+    prop_threshold_label = paste0(prop_threshold * 100, "%")
+  )
+
+fwrite(
+  sensitivity,
+  file.path(out_dir, "threshold_sensitivity_species_counts.csv")
+)
+
+p_sensitivity <- ggplot(
+  sensitivity,
+  aes(
+    x = area_threshold_label,
+    y = prop_threshold_label,
+    fill = n_species
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.7) +
+  geom_text(
+    aes(label = n_species),
+    size = 4.2,
+    fontface = "bold",
+    colour = "black"
+  ) +
+  facet_wrap(~ group) +
+  scale_fill_gradient(
+    low = "#F3F3F3",
+    high = "#3B6EA8",
+    name = "Species"
+  ) +
+  labs(
+    x = "Allowed opposite-land overlap area",
+    y = "Required land proportion",
+    title = "Threshold sensitivity",
+    subtitle = "Counts show how many species meet each area/proportion combination"
+  ) +
+  base_theme +
+  theme(legend.position = "right")
+
+save_plot(p_sensitivity, "04_threshold_sensitivity_heatmap", width = 7.8, height = 4.8)
+
+# ------------------------------------------------------------
+# 5. Species near threshold boundaries for manual checking
+# ------------------------------------------------------------
+
+near_island_boundary <- species %>%
+  filter(
+    !any_area_failed,
+    true_island_area_km2 > 0,
+    true_island_prop_land >= 0.90,
+    mainland_area_km2 > 1
+  ) %>%
+  mutate(
+    diagnostic_group = "Island-like but mainland overlap exceeds 1 km2",
+    opposite_area_km2 = mainland_area_km2,
+    focal_prop_land = true_island_prop_land
+  )
+
+near_mainland_boundary <- species %>%
+  filter(
+    !any_area_failed,
+    mainland_area_km2 > 0,
+    mainland_prop_land >= 0.90,
+    true_island_area_km2 > 1
+  ) %>%
+  mutate(
+    diagnostic_group = "Mainland-like but island overlap exceeds 1 km2",
+    opposite_area_km2 = true_island_area_km2,
+    focal_prop_land = mainland_prop_land
+  )
+
+near_boundary_species <- bind_rows(
+  near_island_boundary,
+  near_mainland_boundary
+) %>%
+  mutate(
+    opposite_area_bin = case_when(
+      opposite_area_km2 <= 10 ~ "1-10 km2",
+      opposite_area_km2 <= 100 ~ "10-100 km2",
+      opposite_area_km2 <= 1000 ~ "100-1000 km2",
+      TRUE ~ ">1000 km2"
+    ),
+    focal_prop_bin = case_when(
+      focal_prop_land >= 0.99 ~ ">=99%",
+      focal_prop_land >= 0.95 ~ "95-99%",
+      TRUE ~ "90-95%"
+    )
+  ) %>%
+  arrange(diagnostic_group, desc(focal_prop_land), opposite_area_km2)
+
+fwrite(
+  near_boundary_species,
+  file.path(out_dir, "near_boundary_species_for_manual_check.csv")
+)
+
+boundary_counts <- near_boundary_species %>%
+  count(diagnostic_group, opposite_area_bin, focal_prop_bin, name = "n_species")
+
+fwrite(
+  boundary_counts,
+  file.path(out_dir, "near_boundary_species_counts.csv")
+)
+
+p_boundary <- ggplot(
+  boundary_counts,
+  aes(x = opposite_area_bin, y = focal_prop_bin, fill = n_species)
+) +
+  geom_tile(colour = "white", linewidth = 0.7) +
+  geom_text(
+    aes(label = n_species),
+    size = 3.8,
+    fontface = "bold",
+    colour = "black"
+  ) +
+  facet_wrap(~ diagnostic_group) +
+  scale_fill_gradient(
+    low = "#F3F3F3",
+    high = "#D55E00",
+    name = "Species"
+  ) +
+  labs(
+    x = "Opposite-land overlap area",
+    y = "Focal land proportion",
+    title = "Boundary species for manual checking",
+    subtitle = "These species are island-like or mainland-like but exceed the strict 1 km2 area tolerance"
+  ) +
+  base_theme
+
+save_plot(p_boundary, "05_near_boundary_species_heatmap", width = 9.6, height = 4.8)
+
