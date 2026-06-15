@@ -108,7 +108,7 @@ occ[, coord_uncertainty_status := fcase(
   coord_uncertainty_m > max_uncertainty_m, "known_gt_100km"
 )]
 
-# 4. Join dataset names after filtering ---------------------------------------
+# 4. Join dataset names after filtering not needed---------------------------------------
 
 dataset_map <- fread(dataset_map_file, encoding = "UTF-8")[
   ,
