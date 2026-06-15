@@ -1,0 +1,268 @@
+#!/usr/bin/env Rscript
+
+library(data.table)
+library(CoordinateCleaner)
+
+# 1. Paths and settings --------------------------------------------------------
+
+download_key <- "0054556-260519110011954"
+
+base_dir <- file.path(
+  "/scratch",
+  Sys.getenv("USER"),
+  "island_bird_project",
+  "gbif"
+)
+
+download_dir <- file.path(base_dir, download_key)
+gbif_file <- file.path(download_dir, paste0(download_key, ".csv"))
+
+dataset_map_file <- file.path(
+  base_dir,
+  "zosteropidae_whitelist",
+  "gbif_dataset_keys_resolved.csv"
+)
+
+out_dir <- file.path(download_dir, "cleaned_simple")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+target_class <- "Aves"
+target_family <- "Zosteropidae"
+max_uncertainty_m <- 100000
+
+basis_of_record_keep <- c(
+  "HUMAN_OBSERVATION",
+  "OBSERVATION",
+  "PRESERVED_SPECIMEN",
+  "MACHINE_OBSERVATION",
+  "MATERIAL_SAMPLE",
+  "MATERIAL_CITATION"
+)
+
+threads <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
+setDTthreads(max(1L, threads))
+
+# 2. Read only necessary GBIF columns -----------------------------------------
+
+cols_keep <- c(
+  "gbifID", "datasetKey", "class", "order", "family",
+  "genus", "species", "taxonRank", "scientificName",
+  "countryCode", "locality", "stateProvince",
+  "occurrenceStatus", "individualCount",
+  "decimalLatitude", "decimalLongitude",
+  "coordinateUncertaintyInMeters", "coordinatePrecision",
+  "eventDate", "year", "month", "day",
+  "taxonKey", "speciesKey", "basisOfRecord",
+  "institutionCode", "collectionCode", "catalogNumber",
+  "recordNumber", "identifiedBy", "recordedBy",
+  "establishmentMeans", "mediaType", "issue"
+)
+
+gbif <- fread(
+  gbif_file,
+  sep = "\t",
+  select = cols_keep,
+  na.strings = c("", "NA"),
+  encoding = "UTF-8",
+  quote = "",
+  nThread = getDTthreads()
+)
+
+message("Input rows: ", nrow(gbif))
+
+# 3. Basic record filters ------------------------------------------------------
+
+occ <- gbif[
+  class == target_class &
+    family == target_family &
+    taxonRank == "SPECIES" &
+    occurrenceStatus == "PRESENT" &
+    basisOfRecord %chin% basis_of_record_keep &
+    !is.na(decimalLongitude) &
+    !is.na(decimalLatitude) &
+    decimalLatitude >= -90 &
+    decimalLatitude <= 90 &
+    decimalLongitude >= -180 &
+    decimalLongitude <= 180 &
+    (
+      is.na(establishmentMeans) |
+        !establishmentMeans %chin% c("CAPTIVE", "CULTIVATED", "MANAGED")
+    )
+]
+
+rm(gbif)
+gc()
+
+occ[, coord_uncertainty_m := suppressWarnings(as.numeric(coordinateUncertaintyInMeters))]
+
+occ <- occ[
+  is.na(coord_uncertainty_m) |
+    coord_uncertainty_m <= max_uncertainty_m
+]
+
+occ[, coord_uncertainty_status := fcase(
+  is.na(coord_uncertainty_m), "missing_unknown",
+  coord_uncertainty_m <= 1000, "known_le_1km",
+  coord_uncertainty_m <= 5000, "known_1_5km",
+  coord_uncertainty_m <= max_uncertainty_m, "known_5_100km",
+  coord_uncertainty_m > max_uncertainty_m, "known_gt_100km"
+)]
+
+# 4. Join dataset names after filtering ---------------------------------------
+
+dataset_map <- fread(dataset_map_file, encoding = "UTF-8")[
+  ,
+  .(
+    datasetKey = matched_key,
+    datasetName = matched_title,
+    publishing_organization,
+    dataset_doi = doi
+  )
+]
+
+occ <- merge(
+  occ,
+  dataset_map,
+  by = "datasetKey",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# 5. GBIF-interpreted name fields ---------------------------------------------
+
+# These are GBIF Backbone-interpreted names, not manual taxonomic checks.
+# A separate GBIF-BirdLife crosswalk is still needed before using BirdLife ranges.
+occ[, `:=`(
+  accepted_name_gbif = species,
+  accepted_key_gbif = speciesKey,
+  name_check_source = "GBIF Backbone interpreted species/speciesKey"
+)]
+
+occ <- occ[
+  !is.na(accepted_name_gbif) &
+    !is.na(accepted_key_gbif)
+]
+
+message("Rows after basic filters and uncertainty filter: ", nrow(occ))
+
+# 6. CoordinateCleaner flags on minimal columns --------------------------------
+
+# Use only strong coordinate-error tests here.
+# Do not remove outliers, sea points, or urban points in this script because
+# island records can be incorrectly flagged by those tests.
+#
+# CoordinateCleaner "zeros" can fail on some server setups because it calls a
+# buffer operation without a CRS. We flag exact 0/0 coordinates manually below.
+cc_input <- occ[
+  ,
+  .(
+    accepted_name_gbif,
+    decimalLongitude,
+    decimalLatitude,
+    countryCode
+  )
+]
+
+coord_flags <- clean_coordinates(
+  x = as.data.frame(cc_input),
+  lon = "decimalLongitude",
+  lat = "decimalLatitude",
+  species = "accepted_name_gbif",
+  countries = "countryCode",
+  tests = c(
+    "capitals",
+    "centroids",
+    "equal",
+    "gbif",
+    "institutions",
+    "duplicates",
+    "seas"
+  ),
+  value = "spatialvalid",
+  verbose = TRUE
+)
+
+flag_cols <- grep("^\\.", names(coord_flags), value = TRUE)
+
+for (flag_col in flag_cols) {
+  occ[, (flag_col) := coord_flags[[flag_col]]]
+}
+
+# Manual zero-coordinate flag.
+# TRUE = passed; FALSE = failed.
+occ[, .zer := !(decimalLongitude == 0 & decimalLatitude == 0)]
+occ[, .summary := .summary & .zer]
+
+rm(cc_input, coord_flags)
+gc()
+
+# Save flagged table before filtering.
+fwrite(
+  occ,
+  file.path(out_dir, "zosteropidae_gbif_flagged.tsv"),
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+# 7. Clean table and evidence labels ------------------------------------------
+
+occ_clean <- occ[.summary == TRUE]
+
+occ_clean[, evidence_type := fcase(
+  basisOfRecord == "PRESERVED_SPECIMEN", "museum_specimen",
+  basisOfRecord == "MACHINE_OBSERVATION", "machine_or_audio",
+  datasetName == "Xeno-canto - Bird sounds from around the world", "bioacoustic",
+  grepl("Ringing|Recapture|SAFRING", datasetName, ignore.case = TRUE), "ringing_recovery",
+  grepl("eBird|Backyard|Observation.org|iNaturalist", datasetName, ignore.case = TRUE), "citizen_science",
+  default = "other"
+)]
+
+# 8. Summaries -----------------------------------------------------------------
+
+summary_dataset <- occ_clean[
+  ,
+  .N,
+  by = .(datasetKey, datasetName, basisOfRecord, evidence_type)
+][order(-N)]
+
+summary_species <- occ_clean[
+  ,
+  .N,
+  by = .(accepted_name_gbif)
+][order(-N)]
+
+summary_uncertainty <- occ_clean[
+  ,
+  .N,
+  by = .(coord_uncertainty_status)
+][order(-N)]
+
+# 9. Save outputs --------------------------------------------------------------
+
+fwrite(
+  occ_clean,
+  file.path(out_dir, "zosteropidae_gbif_clean.tsv"),
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+fwrite(
+  summary_dataset,
+  file.path(out_dir, "summary_dataset.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  summary_species,
+  file.path(out_dir, "summary_species.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  summary_uncertainty,
+  file.path(out_dir, "summary_uncertainty.tsv"),
+  sep = "\t"
+)
+
+message("Rows after CoordinateCleaner strict flags: ", nrow(occ_clean))
+message("Outputs written to: ", out_dir)
