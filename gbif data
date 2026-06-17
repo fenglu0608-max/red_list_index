@@ -1,12 +1,49 @@
 #!/usr/bin/env Rscript
 
+# GBIF Zosteropidae island-first cleaning and flagging workflow
+#
+# This script prepares GBIF occurrence records for species-island matching.
+# It is designed for island bird biogeography, where many true records are on
+# small islands or coastlines. Therefore, we first match records to an island
+# polygon layer and only then run spatial quality diagnostics.
+#
+#
+# - Hard filters are conservative and remove only records that are clearly
+#   unusable for this workflow.
+# - Most CoordinateCleaner tests are diagnostic flags. The duplicate test is
+#   used to remove repeated species-coordinate records before outlier detection.
+#
+#
+# 1. Read selected GBIF columns.
+# 2. Apply basic filters: target class/family, present records, accepted
+#    basisOfRecord types, valid coordinate ranges, and non-captive records.
+# 3. Keep species and subspecies records, then roll subspecies records up to
+#    the GBIF Backbone species/speciesKey.
+# 4. Remove records with known coordinate uncertainty > 5 km, while retaining
+#    records with missing uncertainty as "missing_unknown".
+# 5. Join dataset names, publishers, and DOIs from a resolved dataset-key table.
+# 6. Intersect filtered records with GlbIslands.gdb and keep only on-island
+#    records.
+# 7. Remove severe GBIF coordinate interpretation issues and exact 0/0 records.
+# 8. Run CoordinateCleaner non-outlier flags on island records.
+# 9. Remove duplicate species-coordinate records using the CoordinateCleaner
+#    duplicate flag.
+# 10. Run CoordinateCleaner outlier detection on the duplicate-filtered table.
+# 11. Save GBIF issue flags and CoordinateCleaner flags as diagnostic fields.
+
 library(data.table)
+library(sf)
 library(CoordinateCleaner)
+
+# EN: Use s2 spherical geometry for spatial operations in longitude/latitude.
+sf::sf_use_s2(TRUE)
 
 # 1. Paths and settings --------------------------------------------------------
 
+# EN: GBIF download key. The raw file is usually named "<download_key>.csv".
 download_key <- "0054556-260519110011954"
 
+# EN: Project directory on the cluster. This script is intended to run on Hábrók.
 base_dir <- file.path(
   "/scratch",
   Sys.getenv("USER"),
@@ -14,22 +51,85 @@ base_dir <- file.path(
   "gbif"
 )
 
+# EN: Raw GBIF occurrence table.
 download_dir <- file.path(base_dir, download_key)
 gbif_file <- file.path(download_dir, paste0(download_key, ".csv"))
 
+# EN: Resolved dataset-key table used to add datasetName, publisher, and DOI.
 dataset_map_file <- file.path(
   base_dir,
   "zosteropidae_whitelist",
   "gbif_dataset_keys_resolved.csv"
 )
 
-out_dir <- file.path(download_dir, "cleaned_simple")
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+# EN: Island polygon database. Only the three island layers are used; Mainlands
+# is intentionally excluded.
+project_dir <- path.expand("~/island_bird_project")
+island_gdb <- file.path(project_dir, "GlbIslands.gdb")
+island_layers <- c("BigIslands", "SmallIslands", "VerySmallIslands")
+
+# EN: cleaned_simple stores the main cleaned tables; island_overlap_outliers
+# stores island-overlap outputs and island-level summaries.
+clean_out_dir <- file.path(download_dir, "cleaned_simple")
+dir.create(clean_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+before_island_file <- file.path(
+  clean_out_dir,
+  "zosteropidae_gbif_before_island_overlap.tsv"
+)
+flagged_file <- file.path(clean_out_dir, "zosteropidae_gbif_flagged.tsv")
+clean_file <- file.path(clean_out_dir, "zosteropidae_gbif_clean.tsv")
+stage_counts_file <- file.path(clean_out_dir, "summary_stage_counts.tsv")
+summary_dataset_file <- file.path(clean_out_dir, "summary_dataset.tsv")
+summary_species_file <- file.path(clean_out_dir, "summary_species.tsv")
+summary_uncertainty_file <- file.path(clean_out_dir, "summary_uncertainty.tsv")
+
+island_out_dir <- file.path(download_dir, "island_overlap_outliers")
+dir.create(island_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+island_points_file <- file.path(
+  island_out_dir,
+  "zosteropidae_gbif_island_intersections.tsv"
+)
+island_points_outlier_file <- file.path(
+  island_out_dir,
+  "zosteropidae_gbif_island_intersections_with_outliers.tsv"
+)
+clean_island_flagged_file <- file.path(
+  island_out_dir,
+  "zosteropidae_gbif_clean_with_island_flags.tsv"
+)
+island_overlap_summary_file <- file.path(
+  island_out_dir,
+  "summary_island_overlap_flags.tsv"
+)
+island_species_summary_file <- file.path(
+  island_out_dir,
+  "summary_island_species.tsv"
+)
+island_summary_file <- file.path(
+  island_out_dir,
+  "summary_island.tsv"
+)
+outlier_summary_file <- file.path(
+  island_out_dir,
+  "summary_outlier_flags.tsv"
+)
 
 target_class <- "Aves"
 target_family <- "Zosteropidae"
-max_uncertainty_m <- 100000
 
+# EN: Remove only records with known coordinate uncertainty > 5 km; missing
+# uncertainty values are retained as unknown.
+max_uncertainty_m <- 5000
+
+# EN: Island overlap is the most memory-intensive step. Reading occurrences in
+# chunks avoids converting the entire table to sf at once.
+chunk_size <- 200000
+
+# EN: GBIF basisOfRecord types retained. These include observations, specimens,
+# machine/audio records, and material records. A simpler evidence_type is added
+# later for summaries.
 basis_of_record_keep <- c(
   "HUMAN_OBSERVATION",
   "OBSERVATION",
@@ -39,11 +139,168 @@ basis_of_record_keep <- c(
   "MATERIAL_CITATION"
 )
 
+# EN: Severe GBIF issues. These indicate serious coordinate or interpretation
+# problems, so records with these issues are hard-filtered after island overlap.
+hard_issues <- c(
+  "ZERO_COORDINATE",
+  "COORDINATE_REPROJECTION_FAILED",
+  "COORDINATE_REPROJECTION_SUSPICIOUS",
+  "PRESUMED_SWAPPED_COORDINATE",
+  "PRESUMED_NEGATED_LONGITUDE",
+  "PRESUMED_NEGATED_LATITUDE",
+  "INTERPRETATION_ERROR"
+)
+
+# EN: The following issues are retained as flags only. Taxonomic issues are not
+# deleted here because this workflow already rolls records to GBIF Backbone
+# species/speciesKey, and a GBIF-BirdLife crosswalk can be applied later.
+taxonomy_flag_issues <- c(
+  "TAXON_MATCH_FUZZY",
+  "TAXON_MATCH_AGGREGATE",
+  "TAXON_MATCH_NAME_AND_ID_AMBIGUOUS",
+  "SCIENTIFIC_NAME_AND_ID_INCONSISTENT"
+)
+
+# EN: Geographic-context issues, such as country-coordinate mismatch. These are
+# flagged but retained because island records can involve borders, offshore
+# islands, or differences in GBIF country interpretation.
+geo_context_flag_issues <- c(
+  "COUNTRY_COORDINATE_MISMATCH",
+  "CONTINENT_COORDINATE_MISMATCH",
+  "GEODETIC_DATUM_INVALID"
+)
+
+# EN: GBIF issue about the coordinate uncertainty field itself. Retained as a
+# flag for later inspection.
+coord_quality_flag_issues <- c(
+  "COORDINATE_UNCERTAINTY_METERS_INVALID"
+)
+
+# EN: Conflict between individual count and occurrence status. Because this
+# workflow uses records as presence evidence rather than abundance estimates,
+# this is flagged but not deleted.
+record_flag_issues <- c(
+  "INDIVIDUAL_COUNT_CONFLICTS_WITH_OCCURRENCE_STATUS"
+)
+
+flag_issues <- c(
+  taxonomy_flag_issues,
+  geo_context_flag_issues,
+  coord_quality_flag_issues,
+  record_flag_issues
+)
+
+# EN: Use the CPU count allocated by Slurm for data.table threading.
 threads <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
 setDTthreads(max(1L, threads))
 
-# 2. Read only necessary GBIF columns -----------------------------------------
+stage_counts <- data.table()
 
+# EN: After each major step, record the number of occurrences, unique species
+# names, and unique species keys. The final table is written to
+# summary_stage_counts.tsv so the filtering history can be reported clearly.
+add_stage_count <- function(stage, x) {
+  name_col <- intersect(c("accepted_name_gbif", "species"), names(x))[1]
+  key_col <- intersect(c("accepted_key_gbif", "speciesKey"), names(x))[1]
+  row <- data.table(
+    stage = stage,
+    n_records = nrow(x),
+    n_species_names = if (is.na(name_col)) NA_integer_ else uniqueN(na.omit(x[[name_col]])),
+    n_species_keys = if (is.na(key_col)) NA_integer_ else uniqueN(na.omit(x[[key_col]]))
+  )
+
+  stage_counts <<- rbind(stage_counts, row)
+
+  message(
+    "Stage count - ", stage,
+    ": records=", row$n_records,
+    "; species_names=", row$n_species_names,
+    "; species_keys=", row$n_species_keys
+  )
+}
+
+# EN: These helper functions are used only in island-by-species summaries to
+# show the first and last record year for each island-species combination. They
+# handle all-NA years without producing min/max warnings.
+safe_min_year <- function(x) {
+  x <- suppressWarnings(as.integer(x))
+  if (all(is.na(x))) NA_integer_ else min(x, na.rm = TRUE)
+}
+
+safe_max_year <- function(x) {
+  x <- suppressWarnings(as.integer(x))
+  if (all(is.na(x))) NA_integer_ else max(x, na.rm = TRUE)
+}
+
+# EN: The GBIF issue column can contain multiple issues separated by commas or
+# semicolons. This builds a regex that matches complete issue names rather than
+# accidental substrings.
+issue_pattern <- function(x) {
+  paste0("(^|[;,])(", paste(x, collapse = "|"), ")([;,]|$)")
+}
+
+#
+# EN: Add CoordinateCleaner output columns back to the main table and create
+# easier-to-read summary flags. CoordinateCleaner columns usually start with ".",
+# such as .cap, .cen, .inst, and .dpl. In CoordinateCleaner, TRUE means the record
+# passed the test and FALSE means it was flagged by that test.
+add_coordinatecleaner_flags <- function(dt, coord_flags) {
+  flag_cols <- grep("^\\.", names(coord_flags), value = TRUE)
+
+  for (flag_col in flag_cols) {
+    dt[, (flag_col) := coord_flags[[flag_col]]]
+  }
+
+  if (length(flag_cols) > 0) {
+    dt[
+      ,
+      coordcleaner_flag := rowSums(.SD == FALSE, na.rm = TRUE) > 0,
+      .SDcols = flag_cols
+    ]
+  } else {
+    dt[, coordcleaner_flag := NA]
+  }
+
+  dt[, duplicate_flag_coordinatecleaner := if (".dpl" %in% names(dt)) .dpl == FALSE else NA]
+
+  # EN: Only the duplicate flag is used for deletion in this script; all other
+  # CoordinateCleaner flags are diagnostic.
+  if (".dpl" %in% names(dt)) {
+    dt[, final_keep_duplicate_only := .dpl == TRUE]
+  } else {
+    dt[, final_keep_duplicate_only := TRUE]
+  }
+
+  dt[, coordinatecleaner_removed_final := !final_keep_duplicate_only]
+  dt[, final_keep_after_hard_filters := TRUE]
+
+  invisible(flag_cols)
+}
+
+add_outlier_flags <- function(dt, outlier_flags, outlier_error = NA_character_) {
+  flag_cols <- grep("^\\.", names(outlier_flags), value = TRUE)
+  outlier_col <- grep("out|otl", flag_cols, value = TRUE)
+
+  if (length(outlier_col) > 0) {
+    dt[, (outlier_col[1]) := outlier_flags[[outlier_col[1]]]]
+    dt[, .otl := outlier_flags[[outlier_col[1]]]]
+    dt[, coordcleaner_outlier_flag := .otl == FALSE]
+  } else {
+    dt[, .otl := NA]
+    dt[, coordcleaner_outlier_flag := NA]
+  }
+
+  dt[, outlier_flag := coordcleaner_outlier_flag]
+  dt[, coordcleaner_outlier_error := outlier_error]
+  dt[, coordcleaner_flag := coordcleaner_flag | fifelse(is.na(coordcleaner_outlier_flag), FALSE, coordcleaner_outlier_flag)]
+
+  invisible(outlier_col)
+}
+
+# 2. Read raw GBIF download ----------------------------------------------------
+
+# EN: Read only the columns needed by this workflow. This reduces memory use,
+# which matters when processing millions of GBIF records on the cluster.
 cols_keep <- c(
   "gbifID", "datasetKey", "class", "order", "family",
   "genus", "species", "taxonRank", "scientificName",
@@ -58,6 +315,10 @@ cols_keep <- c(
   "establishmentMeans", "mediaType", "issue"
 )
 
+message("Reading raw GBIF file: ", gbif_file)
+
+# EN: GBIF Darwin Core occurrence files are usually tab-separated. quote = ""
+# avoids problems caused by quotation marks inside text fields.
 gbif <- fread(
   gbif_file,
   sep = "\t",
@@ -69,13 +330,22 @@ gbif <- fread(
 )
 
 message("Input rows: ", nrow(gbif))
+add_stage_count("01_raw_gbif_selected_columns", gbif)
 
 # 3. Basic record filters ------------------------------------------------------
 
+#
+# EN: Basic filters use only clear inclusion criteria:
+# - target class/family only;
+# - species and subspecies ranks, because subspecies are rolled up later;
+# - PRESENT records only;
+# - accepted basisOfRecord types only;
+# - non-missing coordinates within valid longitude/latitude ranges;
+# - exclude captive/cultivated/managed records.
 occ <- gbif[
   class == target_class &
     family == target_family &
-    taxonRank == "SPECIES" &
+    taxonRank %chin% c("SPECIES", "SUBSPECIES") &
     occurrenceStatus == "PRESENT" &
     basisOfRecord %chin% basis_of_record_keep &
     !is.na(decimalLongitude) &
@@ -90,10 +360,23 @@ occ <- gbif[
     )
 ]
 
+add_stage_count("02_basic_record_filters_species_and_subspecies", occ)
+
 rm(gbif)
 gc()
 
-occ[, coord_uncertainty_m := suppressWarnings(as.numeric(coordinateUncertaintyInMeters))]
+#
+#
+# EN: GBIF coordinate uncertainty can be read as character, so it is converted
+# to numeric first. Missing uncertainty does not necessarily mean low quality;
+# many eBird or historical datasets do not provide this field. Missing values
+# are therefore retained and labelled as missing_unknown.
+#
+# Records with known uncertainty > 5 km are removed because they are too coarse
+# for small-island matching.
+occ[, coord_uncertainty_m := suppressWarnings(
+  as.numeric(coordinateUncertaintyInMeters)
+)]
 
 occ <- occ[
   is.na(coord_uncertainty_m) |
@@ -104,12 +387,17 @@ occ[, coord_uncertainty_status := fcase(
   is.na(coord_uncertainty_m), "missing_unknown",
   coord_uncertainty_m <= 1000, "known_le_1km",
   coord_uncertainty_m <= 5000, "known_1_5km",
-  coord_uncertainty_m <= max_uncertainty_m, "known_5_100km",
-  coord_uncertainty_m > max_uncertainty_m, "known_gt_100km"
+  coord_uncertainty_m > max_uncertainty_m, "known_gt_5km"
 )]
 
-# 4. Join dataset names after filtering not needed---------------------------------------
+add_stage_count("03_uncertainty_filter", occ)
 
+# 4. Join dataset names --------------------------------------------------------
+
+#
+# EN: The raw GBIF table usually contains datasetKey, but readable datasetName,
+# publishing organization, and DOI are useful for checking and summaries. These
+# fields are joined from a previously resolved dataset-key table.
 dataset_map <- fread(dataset_map_file, encoding = "UTF-8")[
   ,
   .(
@@ -128,14 +416,30 @@ occ <- merge(
   sort = FALSE
 )
 
-# 5. GBIF-interpreted name fields ---------------------------------------------
+add_stage_count("04_dataset_name_join", occ)
 
-# These are GBIF Backbone-interpreted names, not manual taxonomic checks.
-# A separate GBIF-BirdLife crosswalk is still needed before using BirdLife ranges.
+rm(dataset_map)
+gc()
+
+# 5. GBIF-interpreted species roll-up -----------------------------------------
+
+#
+#
+# EN: GBIF species/speciesKey are GBIF Backbone-interpreted species-level fields.
+# Because this workflow builds a species-island table, SUBSPECIES records are
+# retained and rolled up to species/speciesKey while preserving the original
+# record-level name and rank for checking.
+#
+# This is not a manual taxonomic validation. A GBIF-BirdLife crosswalk is still
+# needed before combining this table with BirdLife ranges or taxonomy.
 occ[, `:=`(
+  gbif_record_rank = taxonRank,
+  gbif_record_name = scientificName,
+  gbif_record_taxon_key = taxonKey,
   accepted_name_gbif = species,
   accepted_key_gbif = speciesKey,
-  name_check_source = "GBIF Backbone interpreted species/speciesKey"
+  subspecies_rolled_to_species = taxonRank == "SUBSPECIES",
+  name_check_source = "GBIF Backbone species/speciesKey; subspecies records rolled up to species"
 )]
 
 occ <- occ[
@@ -143,17 +447,343 @@ occ <- occ[
     !is.na(accepted_key_gbif)
 ]
 
-message("Rows after basic filters and uncertainty filter: ", nrow(occ))
+add_stage_count("05_gbif_species_rollup", occ)
 
-# 6. CoordinateCleaner flags on minimal columns --------------------------------
+# 6. Evidence labels -----------------------------------------------------------
 
-# Use only strong coordinate-error tests here.
-# Do not remove outliers, sea points, or urban points in this script because
-# island records can be incorrectly flagged by those tests.
 #
-# CoordinateCleaner "zeros" can fail on some server setups because it calls a
-# buffer operation without a CRS. We flag exact 0/0 coordinates manually below.
-cc_input <- occ[
+# EN: evidence_type is a simplified label for summaries and visualization. It
+# does not affect filtering. It converts basisOfRecord + datasetName into more
+# interpretable evidence categories such as citizen_science, museum_specimen,
+# and bioacoustic.
+occ[, evidence_type := fcase(
+  basisOfRecord == "PRESERVED_SPECIMEN",
+  "museum_specimen",
+  basisOfRecord == "MACHINE_OBSERVATION",
+  "machine_or_audio",
+  !is.na(datasetName) &
+    datasetName == "Xeno-canto - Bird sounds from around the world",
+  "bioacoustic",
+  !is.na(datasetName) &
+    grepl("Ringing|Recapture|SAFRING", datasetName, ignore.case = TRUE),
+  "ringing_recovery",
+  !is.na(datasetName) &
+    grepl("eBird|Backyard|Observation.org|iNaturalist", datasetName, ignore.case = TRUE),
+  "citizen_science",
+  default = "other"
+)]
+
+message("Rows after basic filters, species roll-up, and uncertainty filter: ", nrow(occ))
+add_stage_count("06_records_before_island_overlap", occ)
+
+fwrite(
+  occ,
+  before_island_file,
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+# EN: The island-overlap step reads before_island_file from disk in chunks.
+# Removing occ here lowers peak memory use.
+rm(occ)
+gc()
+
+# 7. Read island polygons ------------------------------------------------------
+
+# EN: Remove old outputs before each run to avoid appending to or reusing stale
+# files from a previous run.
+for (f in c(
+  island_points_file,
+  island_points_outlier_file,
+  clean_island_flagged_file,
+  island_overlap_summary_file,
+  island_species_summary_file,
+  island_summary_file,
+  outlier_summary_file,
+  flagged_file,
+  clean_file,
+  summary_dataset_file,
+  summary_species_file,
+  summary_uncertainty_file
+)) {
+  if (file.exists(f)) file.remove(f)
+}
+
+message("Reading island vector: ", island_gdb)
+
+#
+# EN: Read one island layer and standardize the fields needed later. The
+# BigIslands, SmallIslands, and VerySmallIslands layers share the same schema,
+# so they can be processed with the same function.
+read_island_layer <- function(layer_name) {
+  message("Reading island layer: ", layer_name)
+  x <- st_read(island_gdb, layer = layer_name, quiet = FALSE)
+
+  # EN: Keep only island attributes needed for matching and summaries to reduce
+  # memory use.
+  x <- x[
+    ,
+    c(
+      "ALL_Uniq", "USGS_ISID", "ID_GID", "Name_USGSO", "NAME_wcmcI",
+      "NAME_LOCAL", "IslandArea", "Area_Geode"
+    )
+  ]
+
+  x$island_layer <- layer_name
+
+  # EN: Occurrence coordinates are WGS84 longitude/latitude, so island polygons
+  # are transformed to EPSG:4326.
+  x <- st_transform(x, 4326)
+
+  # EN: island_id is an internal stable island ID. Prefixing with layer_name
+  # avoids collisions if ALL_Uniq values repeat across layers.
+  x$island_id <- paste(layer_name, x$ALL_Uniq, sep = "_")
+  x$island_source_id <- x$ALL_Uniq
+
+  # EN: Island names can be stored in several fields. The priority is:
+  # NAME_wcmcI -> NAME_LOCAL -> Name_USGSO -> generated layer_ALL_Uniq.
+  clean_name <- function(v) {
+    v <- trimws(as.character(v))
+    v[v == ""] <- NA_character_
+    v
+  }
+
+  island_name_wcmc <- clean_name(x$NAME_wcmcI)
+  island_name_local <- clean_name(x$NAME_LOCAL)
+  island_name_usgso <- clean_name(x$Name_USGSO)
+
+  x$island_name <- fcoalesce(
+    island_name_wcmc,
+    island_name_local,
+    island_name_usgso,
+    paste0(layer_name, "_", x$ALL_Uniq)
+  )
+
+  x
+}
+
+islands <- do.call(
+  rbind,
+  lapply(island_layers, read_island_layer)
+)
+
+# EN: Fix invalid polygons so st_join does not fail because of geometry errors.
+invalid_islands <- !st_is_valid(islands)
+if (any(invalid_islands, na.rm = TRUE)) {
+  message("Fixing invalid island geometries: ", sum(invalid_islands, na.rm = TRUE))
+  st_geometry(islands)[invalid_islands] <- st_geometry(
+    st_make_valid(islands[invalid_islands, ])
+  )
+}
+
+message("Island polygons: ", nrow(islands))
+
+# 8. Chunked point-polygon intersection ---------------------------------------
+
+#
+# EN: This is the core step: intersect occurrence points with island polygons.
+# Because both the occurrence table and island polygon layer are large,
+# converting everything to sf at once is memory-heavy. The table is processed in
+# chunks, and each matched chunk is written immediately to island_points_file.
+message("Reading records before island overlap header: ", before_island_file)
+header <- names(fread(before_island_file, sep = "\t", nrows = 0))
+
+rows_read <- 0L
+rows_on_islands <- 0L
+chunk_id <- 1L
+
+repeat {
+  message("Chunk ", chunk_id, ": reading after data row ", rows_read)
+
+  chunk <- tryCatch(
+    fread(
+      before_island_file,
+      sep = "\t",
+      skip = rows_read + 1L,
+      nrows = chunk_size,
+      header = FALSE,
+      col.names = header,
+      na.strings = c("", "NA"),
+      encoding = "UTF-8",
+      quote = "",
+      nThread = getDTthreads()
+    ),
+    error = function(e) data.table()
+  )
+
+  if (nrow(chunk) == 0) {
+    break
+  }
+
+  rows_read <- rows_read + nrow(chunk)
+
+  # EN: Coordinates were already filtered earlier, but this defensive check
+  # keeps each chunk safe before conversion to sf points.
+  chunk <- chunk[
+    !is.na(decimalLongitude) &
+      !is.na(decimalLatitude) &
+      decimalLatitude >= -90 &
+      decimalLatitude <= 90 &
+      decimalLongitude >= -180 &
+      decimalLongitude <= 180
+  ]
+
+  if (nrow(chunk) == 0) {
+    chunk_id <- chunk_id + 1L
+    next
+  }
+
+  # EN: remove = FALSE keeps longitude/latitude columns in the attribute table
+  # for later TSV outputs.
+  points <- st_as_sf(
+    chunk,
+    coords = c("decimalLongitude", "decimalLatitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+  joined <- st_join(
+    points,
+    islands,
+    join = st_intersects,
+    left = FALSE
+  )
+
+  # EN: left = FALSE keeps only occurrence points that intersect island
+  # polygons. Multiple occurrence points can fall within the same island polygon;
+  # those remain as separate records.
+  if (nrow(joined) > 0) {
+    joined_dt <- as.data.table(st_drop_geometry(joined))
+    joined_dt[, island_overlap_method := "st_intersects"]
+
+    append_out <- file.exists(island_points_file)
+    fwrite(
+      joined_dt,
+      island_points_file,
+      sep = "\t",
+      append = append_out,
+      col.names = !append_out,
+      nThread = getDTthreads()
+    )
+
+    rows_on_islands <- rows_on_islands + nrow(joined_dt)
+  }
+
+  message(
+    "Chunk ", chunk_id,
+    " done; rows read: ", rows_read,
+    "; island intersections so far: ", rows_on_islands
+  )
+
+  rm(chunk, points, joined)
+  gc()
+
+  chunk_id <- chunk_id + 1L
+}
+
+message("Rows read from table before island overlap: ", rows_read)
+message("Rows intersecting island polygons: ", rows_on_islands)
+
+if (!file.exists(island_points_file)) {
+  stop("No occurrence records intersected the island polygons.")
+}
+
+rm(islands)
+gc()
+
+# 9. Build island occurrence table and apply GBIF hard issue filters ----------
+
+#
+# EN: Use the point-island intersection result directly. Multiple occurrence
+# points can fall inside the same island polygon, and each occurrence is kept as
+# one row.
+island_occ_raw <- fread(
+  island_points_file,
+  sep = "\t",
+  na.strings = c("", "NA"),
+  encoding = "UTF-8",
+  quote = "",
+  nThread = getDTthreads()
+)
+
+island_occ_raw[, on_island := TRUE]
+island_occ_raw[, not_on_island_flag := FALSE]
+add_stage_count("07_island_intersection_rows", island_occ_raw)
+
+island_occ <- island_occ_raw
+
+add_stage_count("08_on_island_records_before_issue_hard_filter", island_occ)
+
+# EN: Create GBIF issue flags. Spaces are removed from issue_text so strings
+# such as "A; B" still match the issue pattern.
+island_occ[, issue_text := gsub("\\s+", "", fifelse(is.na(issue), "", issue))]
+
+island_occ[, hard_issue_gbif :=
+  grepl(issue_pattern(hard_issues), issue_text)]
+
+island_occ[, taxonomy_flag_gbif :=
+  grepl(issue_pattern(taxonomy_flag_issues), issue_text)]
+
+island_occ[, geo_context_flag_gbif :=
+  grepl(issue_pattern(geo_context_flag_issues), issue_text)]
+
+island_occ[, coord_quality_flag_gbif :=
+  grepl(issue_pattern(coord_quality_flag_issues), issue_text)]
+
+island_occ[, record_flag_gbif :=
+  grepl(issue_pattern(record_flag_issues), issue_text)]
+
+island_occ[, quality_flag_gbif :=
+  taxonomy_flag_gbif |
+    geo_context_flag_gbif |
+    coord_quality_flag_gbif |
+    record_flag_gbif]
+
+#
+# EN: This is the GBIF issue hard filter. It is applied after island overlap:
+# first, all basically valid points get a chance to match island polygons; then
+# severe coordinate interpretation errors are removed. Exact 0/0 coordinates are
+# also removed here because they are within valid coordinate ranges but not a
+# meaningful location.
+island_occ <- island_occ[
+  hard_issue_gbif == FALSE &
+    !(decimalLongitude == 0 & decimalLatitude == 0)
+]
+
+add_stage_count("09_remove_hard_gbif_issues_and_exact_zero_zero_on_islands", island_occ)
+
+island_overlap_summary <- data.table(
+  on_island = TRUE,
+  not_on_island_flag = FALSE,
+  N = nrow(island_occ)
+)
+
+fwrite(
+  island_overlap_summary,
+  island_overlap_summary_file,
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+fwrite(
+  island_occ,
+  clean_island_flagged_file,
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+message("Island occurrence records after hard filters: ", nrow(island_occ))
+message("Island occurrence table before CoordinateCleaner: ", clean_island_flagged_file)
+
+rm(island_occ_raw, island_overlap_summary)
+gc()
+
+# 10. CoordinateCleaner non-outlier flags on island records -------------------
+
+#
+# EN: First run the non-outlier CoordinateCleaner tests. The duplicate flag is
+# used as a deletion rule; the other flags are retained only as diagnostics.
+cc_input <- island_occ[
   ,
   .(
     accepted_name_gbif,
@@ -163,62 +793,108 @@ cc_input <- occ[
   )
 ]
 
+# EN: Outliers are intentionally excluded here. Outlier detection is run
+# separately after duplicate species-coordinate records are removed.
+# The seas test is also excluded because records have already been filtered by
+# island polygon overlap.
+cc_tests <- c(
+  "capitals",
+  "centroids",
+  "equal",
+  "gbif",
+  "institutions",
+  "duplicates"
+)
+
 coord_flags <- clean_coordinates(
   x = as.data.frame(cc_input),
   lon = "decimalLongitude",
   lat = "decimalLatitude",
   species = "accepted_name_gbif",
   countries = "countryCode",
-  tests = c(
-    "capitals",
-    "centroids",
-    "equal",
-    "gbif",
-    "institutions",
-    "duplicates",
-    "seas"
-  ),
+  tests = cc_tests,
   value = "spatialvalid",
   verbose = TRUE
 )
 
-flag_cols <- grep("^\\.", names(coord_flags), value = TRUE)
+add_coordinatecleaner_flags(island_occ, coord_flags)
 
-for (flag_col in flag_cols) {
-  occ[, (flag_col) := coord_flags[[flag_col]]]
-}
-
-# Manual zero-coordinate flag.
-# TRUE = passed; FALSE = failed.
-occ[, .zer := !(decimalLongitude == 0 & decimalLatitude == 0)]
-occ[, .summary := .summary & .zer]
+add_stage_count("10_coordinatecleaner_non_outlier_flags_on_island_records", island_occ)
 
 rm(cc_input, coord_flags)
 gc()
 
-# Save flagged table before filtering.
+# EN: flagged_file is the main diagnostic table: it contains island records,
+# GBIF issue flags, and non-outlier CoordinateCleaner flags. Duplicate records
+# are still present here, but coordinatecleaner_removed_final marks records that
+# are removed from the final table.
 fwrite(
-  occ,
-  file.path(out_dir, "zosteropidae_gbif_flagged.tsv"),
+  island_occ,
+  flagged_file,
   sep = "\t",
   nThread = getDTthreads()
 )
 
-# 7. Clean table and evidence labels ------------------------------------------
+# 11. Remove duplicate species-coordinate records -----------------------------
 
-occ_clean <- occ[.summary == TRUE]
+#
+# EN: CoordinateCleaner's duplicate test keeps one record for repeated
+# coordinates within the same species. Records with .dpl == FALSE are removed
+# here so repeated points do not dominate the later outlier test.
+occ_clean <- island_occ[final_keep_duplicate_only == TRUE]
+add_stage_count("11_remove_duplicate_species_coordinate_records", occ_clean)
 
-occ_clean[, evidence_type := fcase(
-  basisOfRecord == "PRESERVED_SPECIMEN", "museum_specimen",
-  basisOfRecord == "MACHINE_OBSERVATION", "machine_or_audio",
-  datasetName == "Xeno-canto - Bird sounds from around the world", "bioacoustic",
-  grepl("Ringing|Recapture|SAFRING", datasetName, ignore.case = TRUE), "ringing_recovery",
-  grepl("eBird|Backyard|Observation.org|iNaturalist", datasetName, ignore.case = TRUE), "citizen_science",
-  default = "other"
-)]
+# 12. CoordinateCleaner outlier flags after duplicate removal -----------------
 
-# 8. Summaries -----------------------------------------------------------------
+#
+# EN: Outlier detection is run after duplicate removal. This prevents repeated
+# citizen-science coordinates from dominating spatial outlier detection. Outlier
+# results are still retained as flags only and are not used for additional
+# deletion.
+outlier_input <- occ_clean[
+  ,
+  .(
+    accepted_name_gbif,
+    decimalLongitude,
+    decimalLatitude,
+    countryCode
+  )
+]
 
+coordcleaner_outlier_error <- NA_character_
+
+outlier_flags <- tryCatch(
+  clean_coordinates(
+    x = as.data.frame(outlier_input),
+    lon = "decimalLongitude",
+    lat = "decimalLatitude",
+    species = "accepted_name_gbif",
+    countries = "countryCode",
+    tests = "outliers",
+    value = "spatialvalid",
+    verbose = TRUE
+  ),
+  error = function(e) {
+    coordcleaner_outlier_error <<- conditionMessage(e)
+    warning(
+      "CoordinateCleaner outlier test failed; setting outlier flags to NA. Error: ",
+      coordcleaner_outlier_error
+    )
+    data.frame(.otl = rep(NA, nrow(outlier_input)))
+  }
+)
+
+add_outlier_flags(occ_clean, outlier_flags, coordcleaner_outlier_error)
+add_stage_count("12_coordinatecleaner_outlier_flags_after_duplicate_removal", occ_clean)
+
+rm(outlier_input, outlier_flags)
+gc()
+
+#
+# EN: Three simple summary tables are written for quick checking:
+# - summary_dataset: record counts by dataset / basisOfRecord / evidence_type.
+# - summary_species: record counts by GBIF species-level name.
+# - summary_uncertainty: record counts by coordinate uncertainty category.
 summary_dataset <- occ_clean[
   ,
   .N,
@@ -237,32 +913,136 @@ summary_uncertainty <- occ_clean[
   by = .(coord_uncertainty_status)
 ][order(-N)]
 
-# 9. Save outputs --------------------------------------------------------------
-
 fwrite(
   occ_clean,
-  file.path(out_dir, "zosteropidae_gbif_clean.tsv"),
+  clean_file,
+  sep = "\t",
+  nThread = getDTthreads()
+)
+fwrite(summary_dataset, summary_dataset_file, sep = "\t")
+fwrite(summary_species, summary_species_file, sep = "\t")
+fwrite(summary_uncertainty, summary_uncertainty_file, sep = "\t")
+
+message("Rows after island filter, hard filters, and duplicate removal: ", nrow(occ_clean))
+message("Island-first flagged table written to: ", flagged_file)
+message("Island-first clean table written to: ", clean_file)
+
+# 13. Island summaries ---------------------------------------------------------
+
+#
+# EN: island_species_summary is an island-by-species summary. It is useful for
+# checking how many records, coordinates, datasets, years, and flags support each
+# species on each island.
+island_species_summary <- occ_clean[
+  ,
+  .(
+    n_records_total = .N,
+    n_unique_coordinates = uniqueN(paste(decimalLongitude, decimalLatitude)),
+    n_datasets = uniqueN(datasetKey),
+    n_years = uniqueN(year[!is.na(year)]),
+    first_year = safe_min_year(year),
+    last_year = safe_max_year(year),
+    n_coordinatecleaner_all_pass = sum(coordcleaner_flag == FALSE, na.rm = TRUE),
+    n_coordinatecleaner_any_flag = sum(coordcleaner_flag == TRUE, na.rm = TRUE),
+    n_capital_flagged = sum(.cap == FALSE, na.rm = TRUE),
+    n_centroid_flagged = sum(.cen == FALSE, na.rm = TRUE),
+    n_institution_flagged = sum(.inst == FALSE, na.rm = TRUE),
+    n_equal_lonlat_flagged = sum(.equ == FALSE, na.rm = TRUE),
+    n_outlier_flagged = sum(outlier_flag == TRUE, na.rm = TRUE),
+    has_specimen = any(basisOfRecord == "PRESERVED_SPECIMEN", na.rm = TRUE),
+    has_ebird = any(grepl("eBird", datasetName, ignore.case = TRUE), na.rm = TRUE),
+    has_inaturalist = any(grepl("iNaturalist", datasetName, ignore.case = TRUE), na.rm = TRUE),
+    has_xenocanto = any(grepl("Xeno-canto", datasetName, ignore.case = TRUE), na.rm = TRUE)
+  ),
+  by = .(island_id, island_name, accepted_name_gbif, accepted_key_gbif)
+][order(island_id, accepted_name_gbif)]
+
+#
+# EN: island_summary collapses the island-by-species table to the island level,
+# making it easy to see how many species/records each island has and which
+# islands contain many flagged records.
+island_summary <- island_species_summary[
+  ,
+  .(
+    n_species = uniqueN(accepted_key_gbif),
+    n_records_total = sum(n_records_total),
+    n_unique_coordinates = sum(n_unique_coordinates),
+    n_species_with_specimen = sum(has_specimen),
+    n_species_with_ebird = sum(has_ebird),
+    n_species_with_inaturalist = sum(has_inaturalist),
+    n_species_with_xenocanto = sum(has_xenocanto),
+    n_species_with_coordinatecleaner_any_flag = sum(n_coordinatecleaner_any_flag > 0),
+    n_species_with_capital_flags = sum(n_capital_flagged > 0),
+    n_species_with_centroid_flags = sum(n_centroid_flagged > 0),
+    n_species_with_institution_flags = sum(n_institution_flagged > 0),
+    n_species_with_outlier_flags = sum(n_outlier_flagged > 0)
+  ),
+  by = .(island_id, island_name)
+][order(-n_species, -n_records_total)]
+
+# EN: outlier_summary summarizes CoordinateCleaner outlier flags by species, so
+# species with many spatial outlier records can be inspected quickly.
+outlier_summary <- occ_clean[
+  ,
+  .N,
+  by = .(accepted_name_gbif, .otl, outlier_flag)
+][order(-outlier_flag, -N)]
+
+# 14. Save island outputs ------------------------------------------------------
+
+# - GBIF record fields；
+# - island_id / island_name；
+# - GBIF issue flags；
+# - CoordinateCleaner flags；
+#
+# EN: island_points_outlier_file is the final island occurrence table. It
+# contains GBIF record fields, island identifiers/names, GBIF issue
+# flags, CoordinateCleaner flags, evidence_type, and summary helper fields.
+fwrite(
+  occ_clean,
+  island_points_outlier_file,
   sep = "\t",
   nThread = getDTthreads()
 )
 
 fwrite(
-  summary_dataset,
-  file.path(out_dir, "summary_dataset.tsv"),
-  sep = "\t"
+  island_species_summary,
+  island_species_summary_file,
+  sep = "\t",
+  nThread = getDTthreads()
 )
 
 fwrite(
-  summary_species,
-  file.path(out_dir, "summary_species.tsv"),
-  sep = "\t"
+  island_summary,
+  island_summary_file,
+  sep = "\t",
+  nThread = getDTthreads()
 )
 
 fwrite(
-  summary_uncertainty,
-  file.path(out_dir, "summary_uncertainty.tsv"),
-  sep = "\t"
+  outlier_summary,
+  outlier_summary_file,
+  sep = "\t",
+  nThread = getDTthreads()
 )
 
-message("Rows after CoordinateCleaner strict flags: ", nrow(occ_clean))
-message("Outputs written to: ", out_dir)
+fwrite(
+  stage_counts,
+  stage_counts_file,
+  sep = "\t",
+  nThread = getDTthreads()
+)
+
+# EN: Print all main output paths at the end so they can be copied directly
+# from the Slurm log.
+message("Records before island overlap table: ", before_island_file)
+message("Island intersections before CoordinateCleaner: ", island_points_file)
+message("Island occurrence table before CoordinateCleaner: ", clean_island_flagged_file)
+message("Island-first flagged table: ", flagged_file)
+message("Island-first clean table: ", clean_file)
+message("Final island occurrence table: ", island_points_outlier_file)
+message("Island overlap flag summary: ", island_overlap_summary_file)
+message("Island x species summary: ", island_species_summary_file)
+message("Island summary: ", island_summary_file)
+message("Outlier summary: ", outlier_summary_file)
+message("Stage count summary: ", stage_counts_file)
