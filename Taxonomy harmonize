@@ -1,0 +1,555 @@
+#!/usr/bin/env Rscript
+
+# Harmonize GBIF occurrence species names to HBW-BirdLife taxonomy.
+#
+# This script is meant to run after the GBIF occurrence cleaning / island
+# overlap pipeline. It does not clean coordinates. It only adds a BirdLife
+# species name for downstream BirdLife species-island or range matching.
+#
+# Matching order:
+# 1. GBIF accepted species name exactly matches BirdLife Scientific name.
+# 2. GBIF accepted species name appears in the BirdLife Synonyms column.
+# 3. GBIF species is treated as a subspecies in Avibase HBW-BirdLife 10, so it
+#    is rolled up to the corresponding BirdLife parent species.
+#
+# Records that still do not match are retained and flagged for manual review.
+
+library(data.table)
+library(readxl)
+
+# 1. Paths and settings --------------------------------------------------------
+
+download_key <- "0054556-260519110011954"
+
+base_dir <- file.path(
+  "/scratch",
+  Sys.getenv("USER"),
+  "island_bird_project",
+  "gbif"
+)
+
+download_dir <- file.path(base_dir, download_key)
+
+# Default input is the final cleaned occurrence table from the GBIF cleaning
+# pipeline. Override with:
+#   OCCURRENCE_FILE=/path/to/file.tsv Rscript 12_harmonize...
+occurrence_file <- Sys.getenv(
+  "OCCURRENCE_FILE",
+  file.path(download_dir, "cleaned_simple", "zosteropidae_gbif_clean.tsv")
+)
+
+# Put both Excel files on the cluster, for example:
+#   ~/island_bird_project/taxonomy/
+taxonomy_dir <- file.path(path.expand("~/island_bird_project"), "taxonomy")
+
+birdlife_file <- Sys.getenv(
+  "BIRDLIFE_XLSX",
+  file.path(
+    taxonomy_dir,
+    "Handbook of the Birds of the World and BirdLife International Digital Checklist of the Birds of the World_Version_10.xlsx"
+  )
+)
+
+avibase_file <- Sys.getenv(
+  "AVIBASE_XLSX",
+  file.path(taxonomy_dir, "avibase_data_bibliographic_2025_v1.xlsx")
+)
+
+output_dir <- Sys.getenv(
+  "BIRDLIFE_TAXONOMY_OUT_DIR",
+  file.path(dirname(occurrence_file), "birdlife_taxonomy")
+)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+target_family <- Sys.getenv("TARGET_FAMILY", "Zosteropidae")
+
+birdlife_sheet <- "HBW-BirdLife_v.10"
+avibase_hbw_sheet <- "HBW-Birdlife 10"
+avibase_other_sheets <- c("AviList 2025", "Clements 2025", "IOC 15.1")
+
+occurrence_out_file <- file.path(
+  output_dir,
+  "zosteropidae_gbif_clean_birdlife_taxonomy.tsv"
+)
+
+matched_out_file <- file.path(
+  output_dir,
+  "zosteropidae_gbif_clean_birdlife_matched.tsv"
+)
+
+crosswalk_file <- file.path(
+  output_dir,
+  "gbif_to_birdlife_species_crosswalk.tsv"
+)
+
+summary_file <- file.path(
+  output_dir,
+  "summary_gbif_to_birdlife_taxonomy.tsv"
+)
+
+# 2. Small helper functions ----------------------------------------------------
+
+normalize_name <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- NA_character_
+  x <- gsub("\\s+", " ", trimws(x))
+  x[x == ""] <- NA_character_
+  x
+}
+
+name_key <- function(x) {
+  tolower(normalize_name(x))
+}
+
+first_existing_col <- function(x, candidates) {
+  hit <- intersect(candidates, names(x))
+  if (length(hit) == 0) {
+    stop(
+      "None of these columns were found: ",
+      paste(candidates, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  hit[1]
+}
+
+species_from_subspecies <- function(x) {
+  parts <- strsplit(normalize_name(x), " ", fixed = TRUE)
+  vapply(parts, function(p) {
+    if (length(p) < 2) return(NA_character_)
+    paste(p[1:2], collapse = " ")
+  }, character(1))
+}
+
+gbif_species_candidate_from_hbw_subspecies <- function(x) {
+  parts <- strsplit(normalize_name(x), " ", fixed = TRUE)
+  vapply(parts, function(p) {
+    if (length(p) < 3) return(NA_character_)
+    paste(p[1], p[length(p)])
+  }, character(1))
+}
+
+split_synonyms <- function(x) {
+  if (is.na(x) || trimws(x) == "") return(character())
+  out <- unlist(strsplit(as.character(x), "\\s*;\\s*|\\s*\\n\\s*"))
+  out <- normalize_name(out)
+  out[!is.na(out)]
+}
+
+# 3. Read occurrence species list ---------------------------------------------
+
+message("Reading occurrence table: ", occurrence_file)
+occ <- fread(
+  occurrence_file,
+  sep = "\t",
+  na.strings = c("", "NA"),
+  encoding = "UTF-8"
+)
+
+if (!"accepted_name_gbif" %in% names(occ) && "species" %in% names(occ)) {
+  occ[, accepted_name_gbif := species]
+}
+
+if (!"accepted_key_gbif" %in% names(occ) && "speciesKey" %in% names(occ)) {
+  occ[, accepted_key_gbif := speciesKey]
+}
+
+if (!all(c("accepted_name_gbif", "accepted_key_gbif") %in% names(occ))) {
+  stop(
+    "The occurrence table must contain accepted_name_gbif and accepted_key_gbif, ",
+    "or species and speciesKey.",
+    call. = FALSE
+  )
+}
+
+occ[, accepted_name_gbif := normalize_name(accepted_name_gbif)]
+occ[, accepted_key_gbif := as.character(accepted_key_gbif)]
+occ[, original_row_id_for_taxonomy := .I]
+
+gbif_species <- occ[
+  ,
+  .(n_occurrence_records = .N),
+  by = .(accepted_name_gbif, accepted_key_gbif)
+][order(-n_occurrence_records, accepted_name_gbif)]
+
+message("GBIF species names in occurrence table: ", nrow(gbif_species))
+message("Occurrence records in input table: ", nrow(occ))
+
+# 4. Build BirdLife accepted-name and synonym tables --------------------------
+
+message("Reading BirdLife checklist: ", birdlife_file)
+birdlife_raw <- as.data.table(read_excel(
+  birdlife_file,
+  sheet = birdlife_sheet,
+  skip = 3,
+  .name_repair = "minimal"
+))
+
+birdlife_sci_col <- first_existing_col(birdlife_raw, c("Scientific name"))
+birdlife_family_col <- first_existing_col(birdlife_raw, c("Family name", "Family"))
+birdlife_common_col <- first_existing_col(birdlife_raw, c("Common name"))
+birdlife_order_col <- first_existing_col(birdlife_raw, c("Order"))
+birdlife_syn_col <- first_existing_col(birdlife_raw, c("Synonyms"))
+birdlife_iucn_col <- first_existing_col(
+  birdlife_raw,
+  c("2025 IUCN Red List category", "IUCN Red List category")
+)
+birdlife_sis_col <- first_existing_col(birdlife_raw, c("SISRecID"))
+
+birdlife <- birdlife_raw[
+  ,
+  .(
+    birdlife_name = normalize_name(get(birdlife_sci_col)),
+    birdlife_common_name = as.character(get(birdlife_common_col)),
+    birdlife_family_name = as.character(get(birdlife_family_col)),
+    birdlife_order = as.character(get(birdlife_order_col)),
+    birdlife_iucn_category = as.character(get(birdlife_iucn_col)),
+    birdlife_synonyms = as.character(get(birdlife_syn_col)),
+    birdlife_SISRecID = as.character(get(birdlife_sis_col))
+  )
+]
+
+birdlife <- birdlife[
+  !is.na(birdlife_name) &
+    birdlife_family_name == target_family
+]
+
+birdlife[, birdlife_name_key := name_key(birdlife_name)]
+birdlife <- unique(birdlife, by = "birdlife_name_key")
+
+message("BirdLife species names for ", target_family, ": ", nrow(birdlife))
+
+birdlife_synonyms <- birdlife[
+  ,
+  .(gbif_name = split_synonyms(birdlife_synonyms)),
+  by = .(
+    birdlife_name,
+    birdlife_common_name,
+    birdlife_family_name,
+    birdlife_order,
+    birdlife_iucn_category,
+    birdlife_synonyms,
+    birdlife_SISRecID
+  )
+]
+
+birdlife_synonyms[, gbif_name := normalize_name(gbif_name)]
+birdlife_synonyms <- birdlife_synonyms[!is.na(gbif_name)]
+birdlife_synonyms[, gbif_name_key := name_key(gbif_name)]
+birdlife_synonyms <- unique(birdlife_synonyms, by = c("gbif_name_key", "birdlife_name"))
+
+# If one synonym maps to several BirdLife species, keep it for review rather
+# than assigning it automatically.
+synonym_counts <- birdlife_synonyms[
+  ,
+  .(n_birdlife_matches = uniqueN(birdlife_name)),
+  by = gbif_name_key
+]
+
+birdlife_synonyms_auto <- merge(
+  birdlife_synonyms,
+  synonym_counts[n_birdlife_matches == 1],
+  by = "gbif_name_key"
+)
+
+birdlife_synonyms_ambiguous <- merge(
+  birdlife_synonyms,
+  synonym_counts[n_birdlife_matches > 1],
+  by = "gbif_name_key"
+)
+
+# 5. Build Avibase HBW-BirdLife subspecies roll-up table ----------------------
+
+message("Reading Avibase HBW-BirdLife table: ", avibase_file)
+avibase_hbw <- as.data.table(read_excel(avibase_file, sheet = avibase_hbw_sheet))
+
+avibase_hbw <- avibase_hbw[
+  family_name == target_family &
+    level %chin% c("species", "subsp")
+]
+avibase_hbw[, sci_name := normalize_name(sci_name)]
+
+avibase_hbw_subsp <- avibase_hbw[level == "subsp"]
+avibase_hbw_subsp[, gbif_name := gbif_species_candidate_from_hbw_subspecies(sci_name)]
+avibase_hbw_subsp[, birdlife_name := species_from_subspecies(sci_name)]
+avibase_hbw_subsp[, gbif_name_key := name_key(gbif_name)]
+avibase_hbw_subsp[, birdlife_name_key := name_key(birdlife_name)]
+
+avibase_rollup <- merge(
+  avibase_hbw_subsp[
+    !is.na(gbif_name) &
+      !is.na(birdlife_name) &
+      gbif_name != birdlife_name,
+    .(
+      gbif_name,
+      gbif_name_key,
+      birdlife_name,
+      birdlife_name_key,
+      avibase_hbw_subspecies_name = sci_name,
+      avibase_name_author = authors,
+      avibase_name_year = year,
+      avibase_id
+    )
+  ],
+  birdlife[
+    ,
+    .(
+      birdlife_name_key,
+      birdlife_common_name,
+      birdlife_family_name,
+      birdlife_order,
+      birdlife_iucn_category,
+      birdlife_synonyms,
+      birdlife_SISRecID
+    )
+  ],
+  by = "birdlife_name_key",
+  all.x = FALSE,
+  all.y = FALSE
+)
+
+rollup_counts <- avibase_rollup[
+  ,
+  .(n_birdlife_matches = uniqueN(birdlife_name)),
+  by = gbif_name_key
+]
+
+avibase_rollup_auto <- merge(
+  avibase_rollup,
+  rollup_counts[n_birdlife_matches == 1],
+  by = "gbif_name_key"
+)
+
+avibase_rollup_ambiguous <- merge(
+  avibase_rollup,
+  rollup_counts[n_birdlife_matches > 1],
+  by = "gbif_name_key"
+)
+
+# 6. Add exact species-name support from other Avibase taxonomies -------------
+
+avibase_support <- data.table(
+  gbif_name_key = character(),
+  source = character()
+)
+
+for (sheet_name in c(avibase_other_sheets, avibase_hbw_sheet)) {
+  x <- as.data.table(read_excel(avibase_file, sheet = sheet_name))
+  x <- x[
+    family_name == target_family &
+      level == "species" &
+      !is.na(sci_name)
+  ]
+  x[, gbif_name_key := name_key(sci_name)]
+  source_name <- gsub("[^A-Za-z0-9]+", "_", tolower(sheet_name))
+  avibase_support <- rbind(
+    avibase_support,
+    x[, .(gbif_name_key, source = source_name)],
+    fill = TRUE
+  )
+}
+
+avibase_support <- unique(avibase_support)
+avibase_support_wide <- dcast(
+  avibase_support,
+  gbif_name_key ~ source,
+  fun.aggregate = length,
+  value.var = "source"
+)
+
+for (col in setdiff(names(avibase_support_wide), "gbif_name_key")) {
+  set(avibase_support_wide, j = col, value = avibase_support_wide[[col]] > 0)
+}
+
+# 7. Match each GBIF species to BirdLife --------------------------------------
+
+match_one_species <- function(gbif_name, gbif_key, n_records) {
+  key <- name_key(gbif_name)
+
+  out <- data.table(
+    accepted_name_gbif = gbif_name,
+    accepted_key_gbif = gbif_key,
+    n_occurrence_records = n_records,
+    birdlife_match_status = "no_birdlife_match",
+    birdlife_name = NA_character_,
+    birdlife_common_name = NA_character_,
+    birdlife_family_name = NA_character_,
+    birdlife_order = NA_character_,
+    birdlife_iucn_category = NA_character_,
+    birdlife_synonyms = NA_character_,
+    birdlife_SISRecID = NA_character_,
+    matched_by = NA_character_,
+    avibase_hbw_subspecies_name = NA_character_,
+    possible_birdlife_matches = NA_character_
+  )
+
+  direct <- birdlife[birdlife_name_key == key]
+  if (nrow(direct) > 0) {
+    out[, `:=`(
+      birdlife_match_status = "birdlife_scientific_name_match",
+      birdlife_name = direct$birdlife_name[1],
+      birdlife_common_name = direct$birdlife_common_name[1],
+      birdlife_family_name = direct$birdlife_family_name[1],
+      birdlife_order = direct$birdlife_order[1],
+      birdlife_iucn_category = direct$birdlife_iucn_category[1],
+      birdlife_synonyms = direct$birdlife_synonyms[1],
+      birdlife_SISRecID = direct$birdlife_SISRecID[1],
+      matched_by = "BirdLife Scientific name"
+    )]
+    return(out)
+  }
+
+  syn_amb <- birdlife_synonyms_ambiguous[gbif_name_key == key]
+  if (nrow(syn_amb) > 0) {
+    out[, `:=`(
+      birdlife_match_status = "birdlife_synonym_ambiguous_review",
+      possible_birdlife_matches = paste(sort(unique(syn_amb$birdlife_name)), collapse = "; "),
+      matched_by = "BirdLife Synonyms ambiguous"
+    )]
+    return(out)
+  }
+
+  syn <- birdlife_synonyms_auto[gbif_name_key == key]
+  if (nrow(syn) > 0) {
+    out[, `:=`(
+      birdlife_match_status = "birdlife_synonym_match",
+      birdlife_name = syn$birdlife_name[1],
+      birdlife_common_name = syn$birdlife_common_name[1],
+      birdlife_family_name = syn$birdlife_family_name[1],
+      birdlife_order = syn$birdlife_order[1],
+      birdlife_iucn_category = syn$birdlife_iucn_category[1],
+      birdlife_synonyms = syn$birdlife_synonyms[1],
+      birdlife_SISRecID = syn$birdlife_SISRecID[1],
+      matched_by = "BirdLife Synonyms"
+    )]
+    return(out)
+  }
+
+  roll_amb <- avibase_rollup_ambiguous[gbif_name_key == key]
+  if (nrow(roll_amb) > 0) {
+    out[, `:=`(
+      birdlife_match_status = "avibase_hbw_subspecies_rollup_ambiguous_review",
+      possible_birdlife_matches = paste(sort(unique(roll_amb$birdlife_name)), collapse = "; "),
+      matched_by = "Avibase HBW-BirdLife subspecies ambiguous"
+    )]
+    return(out)
+  }
+
+  roll <- avibase_rollup_auto[gbif_name_key == key]
+  if (nrow(roll) > 0) {
+    out[, `:=`(
+      birdlife_match_status = "avibase_hbw_subspecies_rollup",
+      birdlife_name = roll$birdlife_name[1],
+      birdlife_common_name = roll$birdlife_common_name[1],
+      birdlife_family_name = roll$birdlife_family_name[1],
+      birdlife_order = roll$birdlife_order[1],
+      birdlife_iucn_category = roll$birdlife_iucn_category[1],
+      birdlife_synonyms = roll$birdlife_synonyms[1],
+      birdlife_SISRecID = roll$birdlife_SISRecID[1],
+      matched_by = "Avibase HBW-BirdLife subspecies roll-up",
+      avibase_hbw_subspecies_name = roll$avibase_hbw_subspecies_name[1]
+    )]
+    return(out)
+  }
+
+  out
+}
+
+crosswalk <- rbindlist(
+  lapply(seq_len(nrow(gbif_species)), function(i) {
+    match_one_species(
+      gbif_species$accepted_name_gbif[i],
+      gbif_species$accepted_key_gbif[i],
+      gbif_species$n_occurrence_records[i]
+    )
+  }),
+  fill = TRUE
+)
+
+crosswalk[, gbif_name_key := name_key(accepted_name_gbif)]
+crosswalk <- merge(crosswalk, avibase_support_wide, by = "gbif_name_key", all.x = TRUE)
+
+for (col in setdiff(names(avibase_support_wide), "gbif_name_key")) {
+  crosswalk[is.na(get(col)), (col) := FALSE]
+}
+
+crosswalk[, birdlife_matched := !is.na(birdlife_name)]
+setcolorder(
+  crosswalk,
+  c(
+    "accepted_name_gbif",
+    "accepted_key_gbif",
+    "n_occurrence_records",
+    "birdlife_matched",
+    "birdlife_match_status",
+    "birdlife_name",
+    "birdlife_common_name",
+    "matched_by",
+    "avibase_hbw_subspecies_name"
+  )
+)
+
+# 8. Add BirdLife taxonomy columns to occurrence records ----------------------
+
+occ_harmonized <- merge(
+  occ,
+  crosswalk[
+    ,
+    !c("n_occurrence_records", "gbif_name_key")
+  ],
+  by = c("accepted_name_gbif", "accepted_key_gbif"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+setorder(occ_harmonized, original_row_id_for_taxonomy)
+occ_harmonized[, original_row_id_for_taxonomy := NULL]
+
+occ_birdlife_matched <- occ_harmonized[birdlife_matched == TRUE]
+
+# 9. Summaries and outputs -----------------------------------------------------
+
+summary_status <- crosswalk[
+  ,
+  .(
+    n_gbif_species = .N,
+    n_occurrence_records = sum(n_occurrence_records),
+    example_gbif_names = paste(head(accepted_name_gbif, 12), collapse = "; ")
+  ),
+  by = .(birdlife_match_status, birdlife_matched)
+][order(-birdlife_matched, -n_occurrence_records)]
+
+summary_overall <- data.table(
+  metric = c(
+    "input_occurrence_records",
+    "input_gbif_species",
+    "birdlife_matched_occurrence_records",
+    "birdlife_matched_species",
+    "unmatched_or_review_occurrence_records",
+    "unmatched_or_review_species"
+  ),
+  value = c(
+    nrow(occ),
+    nrow(gbif_species),
+    nrow(occ_birdlife_matched),
+    uniqueN(crosswalk[birdlife_matched == TRUE, accepted_name_gbif]),
+    nrow(occ_harmonized[birdlife_matched != TRUE | is.na(birdlife_matched)]),
+    uniqueN(crosswalk[birdlife_matched != TRUE | is.na(birdlife_matched), accepted_name_gbif])
+  )
+)
+
+fwrite(crosswalk[order(-n_occurrence_records)], crosswalk_file, sep = "\t")
+fwrite(occ_harmonized, occurrence_out_file, sep = "\t")
+fwrite(occ_birdlife_matched, matched_out_file, sep = "\t")
+fwrite(summary_status, summary_file, sep = "\t")
+
+message("===== Overall summary =====")
+print(summary_overall)
+
+message("===== Match status summary =====")
+print(summary_status)
+
+message("Crosswalk written to: ", crosswalk_file)
+message("All occurrence records with BirdLife taxonomy written to: ", occurrence_out_file)
+message("BirdLife-matched occurrence records written to: ", matched_out_file)
+message("Summary written to: ", summary_file)
