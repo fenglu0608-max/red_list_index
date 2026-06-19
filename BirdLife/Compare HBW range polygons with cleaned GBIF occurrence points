@@ -1,0 +1,375 @@
+#!/usr/bin/env Rscript
+
+# Compare BirdLife/HBW range polygons with cleaned GBIF occurrence points.
+#
+# Main outputs:
+#   1. islands supported by GBIF occurrence points
+#   2. islands intersecting BirdLife/HBW range polygons
+#   3. island x species pairs supported by both sources
+#   4. summary tables and a visual-check PDF
+
+library(data.table)
+library(sf)
+library(ggplot2)
+
+Sys.setenv(OGR_ORGANIZE_POLYGONS = "SKIP")
+sf_use_s2(FALSE)
+options(warn = 1)
+
+download_key <- "0054556-260519110011954"
+
+gbif_dir <- file.path("/scratch", Sys.getenv("USER"), "island_bird_project", "gbif")
+project_dir <- path.expand("~/island_bird_project")
+download_dir <- file.path(gbif_dir, download_key)
+
+occurrence_file <- Sys.getenv(
+  "BIRDLIFE_MATCHED_OCCURRENCE_FILE",
+  file.path(
+    download_dir,
+    "cleaned_simple",
+    "birdlife_taxonomy",
+    "zosteropidae_gbif_clean_birdlife_matched.tsv"
+  )
+)
+
+birdlife_range_file <- Sys.getenv(
+  "BIRDLIFE_RANGE_FILE",
+  file.path(project_dir, "BOTW_2025.gpkg")
+)
+
+birdlife_range_layer <- Sys.getenv("BIRDLIFE_RANGE_LAYER", "all_species")
+
+island_gdb <- Sys.getenv(
+  "ISLAND_GDB",
+  file.path(project_dir, "GlbIslands.gdb")
+)
+
+island_layers <- c("BigIslands", "SmallIslands", "VerySmallIslands")
+
+out_dir <- Sys.getenv(
+  "BIRDLIFE_RANGE_OVERLAP_OUT_DIR",
+  file.path(download_dir, "birdlife_range_overlap")
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+occurrence_island_species_file <- file.path(out_dir, "occurrence_island_species.tsv")
+range_island_species_file <- file.path(out_dir, "birdlife_range_island_species.tsv")
+both_source_file <- file.path(out_dir, "both_source_island_species.tsv")
+source_overlap_file <- file.path(out_dir, "birdlife_occurrence_island_source_overlap.tsv")
+species_summary_file <- file.path(out_dir, "summary_species_range_occurrence_overlap.tsv")
+island_summary_file <- file.path(out_dir, "summary_island_range_occurrence_overlap.tsv")
+visual_species_file <- file.path(out_dir, "visual_check_selected_species.tsv")
+visual_pdf_file <- file.path(out_dir, "visual_check_birdlife_ranges_occurrence_points.pdf")
+
+presence_keep <- c(1)
+origin_keep <- c(1)
+seasonal_keep <- c(1, 2)
+visual_species_n <- as.integer(Sys.getenv("VISUAL_SPECIES_N", "12"))
+
+message("Reading matched occurrence table: ", occurrence_file)
+occ <- fread(
+  occurrence_file,
+  sep = "\t",
+  na.strings = c("", "NA"),
+  encoding = "UTF-8"
+)
+
+occ[, gbifID := as.character(gbifID)]
+occ[, harmonized_birdlife_SISRecID := as.character(harmonized_birdlife_SISRecID)]
+
+occ <- occ[
+  birdlife_matched == TRUE &
+    !is.na(harmonized_birdlife_SISRecID) &
+    !is.na(ALL_Uniq) &
+    !is.na(decimalLongitude) &
+    !is.na(decimalLatitude)
+]
+
+occ[, ALL_Uniq := trimws(as.character(ALL_Uniq))]
+
+message("Occurrence records with BirdLife IDs and island IDs: ", nrow(occ))
+message("BirdLife species in occurrence table: ", uniqueN(occ$harmonized_birdlife_SISRecID))
+message("Occurrence-supported islands: ", uniqueN(occ$ALL_Uniq))
+
+message("Reading island polygons from: ", island_gdb)
+island_list <- vector("list", length(island_layers))
+
+for (i in seq_along(island_layers)) {
+  layer_name <- island_layers[i]
+  message("Reading island layer: ", layer_name)
+
+  x <- st_read(island_gdb, layer = layer_name, quiet = FALSE)
+  x <- x[!st_is_empty(x), ]
+  x <- st_make_valid(x)
+  x <- st_transform(x, 4326)
+
+  x$ALL_Uniq <- trimws(as.character(x$ALL_Uniq))
+  x$island_layer <- layer_name
+
+  name_wcmc <- trimws(as.character(x$NAME_wcmcI))
+  name_local <- trimws(as.character(x$NAME_LOCAL))
+  name_usgso <- trimws(as.character(x$Name_USGSO))
+  name_wcmc[name_wcmc == ""] <- NA_character_
+  name_local[name_local == ""] <- NA_character_
+  name_usgso[name_usgso == ""] <- NA_character_
+
+  x$island_name <- fcoalesce(
+    name_wcmc,
+    name_local,
+    name_usgso,
+    paste0(layer_name, "_", x$ALL_Uniq)
+  )
+
+  island_list[[i]] <- x[
+    ,
+    c("ALL_Uniq", "island_name", "island_layer", "IslandArea", "Area_Geode")
+  ]
+}
+
+islands_keep <- do.call(rbind, island_list)
+message("Island polygons used: ", nrow(islands_keep))
+
+fwrite(
+  occ,
+  file.path(out_dir, "occurrence_points_on_islands.tsv"),
+  sep = "\t"
+)
+
+# One row per BirdLife species per island, counting how many GBIF records support it.
+occurrence_island_species <- occ[
+  ,
+  .(
+    birdlife_species_name = harmonized_birdlife_name[1],
+    island_name = island_name[1],
+    n_occurrence_records = .N,
+    n_unique_coordinates = uniqueN(paste(decimalLongitude, decimalLatitude))
+  ),
+  by = .(harmonized_birdlife_SISRecID, ALL_Uniq)
+]
+
+fwrite(occurrence_island_species, occurrence_island_species_file, sep = "\t")
+
+target_sis <- sort(unique(occ$harmonized_birdlife_SISRecID))
+target_sis_sql <- paste(sprintf("'%s'", target_sis), collapse = ",")
+
+bird_where <- paste0(
+  "presence IN (", paste(presence_keep, collapse = ","), ") ",
+  "AND origin IN (", paste(origin_keep, collapse = ","), ") ",
+  "AND seasonal IN (", paste(seasonal_keep, collapse = ","), ")"
+)
+
+bird_query <- paste0(
+  "SELECT sisid, sci_name, presence, origin, seasonal, geom ",
+  "FROM ", birdlife_range_layer, " ",
+  "WHERE ", bird_where, " ",
+  "AND sisid IN (", target_sis_sql, ")"
+)
+
+message("Reading BirdLife/HBW range polygons.")
+ranges <- st_read(
+  dsn = birdlife_range_file,
+  query = bird_query,
+  quiet = FALSE
+)
+
+ranges <- ranges[!st_is_empty(ranges), ]
+ranges <- st_make_valid(ranges)
+ranges <- st_transform(ranges, 4326)
+ranges$sisid <- as.character(ranges$sisid)
+
+message("BirdLife range polygons read: ", nrow(ranges))
+message("BirdLife species represented by range polygons: ", uniqueN(ranges$sisid))
+
+range_species <- sort(unique(ranges$sisid))
+range_results <- vector("list", length(range_species))
+
+message("Intersecting BirdLife ranges with islands species by species.")
+for (i in seq_along(range_species)) {
+  sid <- range_species[i]
+  sp_range <- ranges[ranges$sisid == sid, ]
+
+  hit <- st_intersects(islands_keep, sp_range)
+  keep <- lengths(hit) > 0
+
+  x <- as.data.table(st_drop_geometry(islands_keep[keep, ]))
+  x[, harmonized_birdlife_SISRecID := sid]
+  x[, birdlife_range_name := sp_range$sci_name[1]]
+  x[, n_range_polygons_intersecting := lengths(hit[keep])]
+
+  range_results[[i]] <- x
+}
+
+range_island_species <- rbindlist(range_results, fill = TRUE)
+range_island_species <- unique(
+  range_island_species[
+    ,
+    .(
+      harmonized_birdlife_SISRecID,
+      birdlife_range_name,
+      ALL_Uniq,
+      island_name,
+      island_layer,
+      IslandArea,
+      Area_Geode,
+      n_range_polygons_intersecting
+    )
+  ]
+)
+
+fwrite(range_island_species, range_island_species_file, sep = "\t")
+message("Range-supported island x species pairs: ", nrow(range_island_species))
+
+source_overlap <- merge(
+  range_island_species[
+    ,
+    .(
+      harmonized_birdlife_SISRecID,
+      ALL_Uniq,
+      range_island_name = island_name,
+      birdlife_range_name,
+      island_layer,
+      IslandArea,
+      Area_Geode,
+      n_range_polygons_intersecting
+    )
+  ],
+  occurrence_island_species[
+    ,
+    .(
+      harmonized_birdlife_SISRecID,
+      ALL_Uniq,
+      occurrence_island_name = island_name,
+      birdlife_species_name,
+      n_occurrence_records,
+      n_unique_coordinates
+    )
+  ],
+  by = c("harmonized_birdlife_SISRecID", "ALL_Uniq"),
+  all = TRUE,
+  sort = FALSE
+)
+
+source_overlap[, island_name := fcoalesce(occurrence_island_name, range_island_name)]
+source_overlap[, harmonized_birdlife_name := fcoalesce(birdlife_species_name, birdlife_range_name)]
+source_overlap[, source_overlap_status := fcase(
+  !is.na(n_range_polygons_intersecting) & !is.na(n_occurrence_records), "both_range_and_occurrence",
+  !is.na(n_range_polygons_intersecting) & is.na(n_occurrence_records), "range_only",
+  is.na(n_range_polygons_intersecting) & !is.na(n_occurrence_records), "occurrence_only",
+  default = "unknown"
+)]
+
+setcolorder(
+  source_overlap,
+  c(
+    "harmonized_birdlife_SISRecID",
+    "harmonized_birdlife_name",
+    "ALL_Uniq",
+    "island_name",
+    "source_overlap_status"
+  )
+)
+
+fwrite(source_overlap, source_overlap_file, sep = "\t")
+
+both_source <- source_overlap[source_overlap_status == "both_range_and_occurrence"]
+fwrite(both_source, both_source_file, sep = "\t")
+
+species_summary <- source_overlap[
+  ,
+  .(
+    harmonized_birdlife_name = harmonized_birdlife_name[1],
+    n_islands_both = sum(source_overlap_status == "both_range_and_occurrence"),
+    n_islands_range_only = sum(source_overlap_status == "range_only"),
+    n_islands_occurrence_only = sum(source_overlap_status == "occurrence_only"),
+    n_islands_range_total = sum(source_overlap_status %chin% c("both_range_and_occurrence", "range_only")),
+    n_islands_occurrence_total = sum(source_overlap_status %chin% c("both_range_and_occurrence", "occurrence_only")),
+    n_occurrence_records = sum(n_occurrence_records, na.rm = TRUE)
+  ),
+  by = harmonized_birdlife_SISRecID
+][order(-n_islands_both, -n_occurrence_records)]
+
+island_summary <- source_overlap[
+  ,
+  .(
+    island_name = island_name[1],
+    n_species_both = sum(source_overlap_status == "both_range_and_occurrence"),
+    n_species_range_only = sum(source_overlap_status == "range_only"),
+    n_species_occurrence_only = sum(source_overlap_status == "occurrence_only"),
+    n_species_range_total = sum(source_overlap_status %chin% c("both_range_and_occurrence", "range_only")),
+    n_species_occurrence_total = sum(source_overlap_status %chin% c("both_range_and_occurrence", "occurrence_only")),
+    n_occurrence_records = sum(n_occurrence_records, na.rm = TRUE)
+  ),
+  by = ALL_Uniq
+][order(-n_species_both, -n_occurrence_records)]
+
+fwrite(species_summary, species_summary_file, sep = "\t")
+fwrite(island_summary, island_summary_file, sep = "\t")
+
+message("Both-source island x species pairs: ", nrow(both_source))
+
+selected_species <- species_summary[
+  n_islands_both > 0
+][
+  order(-n_occurrence_records, -n_islands_both)
+][
+  seq_len(min(.N, visual_species_n)),
+  harmonized_birdlife_SISRecID
+]
+
+visual_species <- species_summary[harmonized_birdlife_SISRecID %chin% selected_species]
+fwrite(visual_species, visual_species_file, sep = "\t")
+
+visual_points <- st_as_sf(
+  occ[harmonized_birdlife_SISRecID %chin% selected_species],
+  coords = c("decimalLongitude", "decimalLatitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+pdf(visual_pdf_file, width = 11, height = 8.5)
+for (sid in selected_species) {
+  sp_range <- ranges[ranges$sisid == sid, ]
+  sp_points <- visual_points[visual_points$harmonized_birdlife_SISRecID == sid, ]
+  both_ids <- both_source[harmonized_birdlife_SISRecID == sid, ALL_Uniq]
+  sp_both_islands <- islands_keep[islands_keep$ALL_Uniq %in% both_ids, ]
+
+  plot_geoms <- c(st_geometry(sp_range), st_geometry(sp_points), st_geometry(sp_both_islands))
+  bb <- st_bbox(plot_geoms)
+  xpad <- max(1, (bb["xmax"] - bb["xmin"]) * 0.08)
+  ypad <- max(1, (bb["ymax"] - bb["ymin"]) * 0.08)
+
+  sp_name <- species_summary[
+    harmonized_birdlife_SISRecID == sid,
+    harmonized_birdlife_name
+  ][1]
+
+  p <- ggplot() +
+    geom_sf(data = sp_range, fill = "#7BC96F", color = "#2F855A", alpha = 0.25, linewidth = 0.15) +
+    geom_sf(data = sp_both_islands, fill = "#2B6CB0", color = NA, alpha = 0.65) +
+    geom_sf(data = sp_points, color = "#C53030", alpha = 0.35, size = 0.35) +
+    coord_sf(
+      xlim = c(bb["xmin"] - xpad, bb["xmax"] + xpad),
+      ylim = c(bb["ymin"] - ypad, bb["ymax"] + ypad),
+      expand = FALSE
+    ) +
+    labs(
+      title = paste0(sp_name, " (SISRecID ", sid, ")"),
+      subtitle = "Green = BirdLife native resident/breeding range; red = GBIF points; blue = islands supported by both",
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_minimal(base_size = 10)
+
+  print(p)
+}
+dev.off()
+
+message("Visual check PDF: ", visual_pdf_file)
+
+message("Occurrence island x species table: ", occurrence_island_species_file)
+message("BirdLife range island x species table: ", range_island_species_file)
+message("Both-source island x species table: ", both_source_file)
+message("Source overlap table: ", source_overlap_file)
+message("Species summary: ", species_summary_file)
+message("Island summary: ", island_summary_file)
