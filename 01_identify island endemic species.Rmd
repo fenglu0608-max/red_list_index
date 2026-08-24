@@ -71,9 +71,10 @@ options(warn = 1)
 
 project_dir <- path.expand("~/island_bird_project")
 
-bird_path <- file.path(project_dir, "BOTW_2025.gpkg")
-mainland_gdb <- file.path(project_dir, "GlbIslands.gdb")
-island_gpkg <- file.path(project_dir, "global_islands_rli.gpkg")
+bird_path <- file.path(project_dir, "data", "species", "BOTW_2025.gpkg")
+mainland_gdb <- file.path(project_dir, "data", "vectors", "GlbIslands.gdb")
+island_gpkg <- file.path(project_dir, "data", "vectors", "global_islands_rli.gpkg")
+
 island_layer <- "global_islands_rli"
 
 out_dir <- file.path(project_dir, "output")
