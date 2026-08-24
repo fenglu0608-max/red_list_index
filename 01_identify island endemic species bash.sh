@@ -20,4 +20,4 @@ export CHUNK_SIZE=10
 
 RSCRIPT="/cvmfs/hpc.rug.nl/versions/2023.01/rocky8/x86_64/amd/zen3/software/R/4.2.1-foss-2022a/bin/Rscript"
 
-"$RSCRIPT" island_bird_global_island_filter_stratified.R
+"$RSCRIPT" scripts/classification/island_bird_global_island_filter_category_sensitivity.R
