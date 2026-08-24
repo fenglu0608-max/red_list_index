@@ -1,0 +1,81 @@
+library(sf)
+
+sf_use_s2(FALSE)
+
+project_dir <- path.expand("~/island_bird_project")
+gis_dir <- file.path(project_dir, "data", "vectors", "mainland_buffers")
+
+mainland <- st_read(
+  file.path(gis_dir, "mainland_metric.gpkg"),
+  quiet = FALSE
+) |>
+  st_make_valid()
+
+world_bbox <- st_as_sfc(
+  st_bbox(
+    c(
+      xmin = -20037508,
+      ymin = -20037508,
+      xmax = 20037508,
+      ymax = 20037508
+    ),
+    crs = 3857
+  )
+)
+
+# Positive 1 km mainland buffer.
+mainland_buffer_1km <- mainland |>
+  st_buffer(dist = 1000, nQuadSegs = 30) |>
+  st_intersection(world_bbox) |>
+  st_union() |>
+  st_make_valid()
+
+st_write(
+  st_sf(
+    id = 1,
+    buffer_km = 1,
+    geometry = mainland_buffer_1km
+  ),
+  file.path(gis_dir, "mainland_buffer_plus1km.gpkg"),
+  delete_dsn = TRUE
+)
+
+# Merge all mainland polygons before applying the 50 km closing operation.
+mainland_union <- mainland |>
+  st_union() |>
+  st_make_valid()
+
+# Positive 50 km buffer.
+mainland_buffer_plus50km <- mainland_union |>
+  st_buffer(dist = 50000, nQuadSegs = 30) |>
+  st_intersection(world_bbox) |>
+  st_make_valid()
+
+# Positive 50 km followed by negative 50 km:
+# closes sea gaps narrower than approximately 100 km.
+mainland_closed50km <- mainland_buffer_plus50km |>
+  st_buffer(dist = -50000, nQuadSegs = 30) |>
+  st_intersection(world_bbox) |>
+  st_make_valid()
+
+st_write(
+  st_sf(
+    id = 1,
+    buffer_km = 50,
+    geometry = mainland_buffer_plus50km
+  ),
+  file.path(gis_dir, "mainland_buffer_plus50km.gpkg"),
+  delete_dsn = TRUE
+)
+
+st_write(
+  st_sf(
+    id = 1,
+    buffer_km = 50,
+    geometry = mainland_closed50km
+  ),
+  file.path(gis_dir, "mainland_closed50km.gpkg"),
+  delete_dsn = TRUE
+)
+
+cat("Finished: +1 km, +50 km, and +50/-50 km mainland masks.\n")
