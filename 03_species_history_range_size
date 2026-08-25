@@ -1,0 +1,120 @@
+library(sf)
+library(data.table)
+
+sf_use_s2(FALSE)
+Sys.setenv(OGR_ORGANIZE_POLYGONS = "SKIP")
+
+project_dir <- path.expand("~/island_bird_project")
+
+bird_path <- file.path(
+  project_dir,
+  "data",
+  "species",
+  "BOTW_2025.gpkg"
+)
+
+out_dir <- file.path(
+  project_dir,
+  "output",
+  "historical_range_size_chunks"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+equal_area_crs <- 6933
+
+array_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+species_per_job <- 100
+
+offset_n <- (array_id - 1) * species_per_job
+job_label <- sprintf("job%03d", array_id)
+
+bird_query <- paste0(
+  "SELECT sisid, sci_name, presence, origin, seasonal, geom ",
+  "FROM all_species ",
+  "WHERE presence IN (1,2,4,5) ",
+  "AND origin IN (1,2) ",
+  "AND seasonal IN (1,2) ",
+  "AND sisid IN (",
+  "SELECT sisid FROM (",
+  "SELECT DISTINCT sisid ",
+  "FROM all_species ",
+  "WHERE presence IN (1,2,4,5) ",
+  "AND origin IN (1,2) ",
+  "AND seasonal IN (1,2) ",
+  "ORDER BY sisid ",
+  "LIMIT ", species_per_job,
+  " OFFSET ", offset_n,
+  ")"
+)
+
+birds <- st_read(
+  bird_path,
+  query = bird_query,
+  quiet = TRUE
+)
+
+if (nrow(birds) == 0) {
+  quit(save = "no", status = 0)
+}
+
+birds <- birds[
+  !st_is_empty(birds),
+] |>
+  st_make_valid() |>
+  st_transform(equal_area_crs)
+
+species_ids <- unique(birds$sisid)
+
+results <- lapply(species_ids, function(id) {
+  x <- birds[birds$sisid == id, ]
+
+  g <- tryCatch(
+    st_union(st_geometry(x)),
+    error = function(e) NULL
+  )
+
+  if (is.null(g)) {
+    return(data.frame(
+      sisid = id,
+      sci_name = x$sci_name[1],
+      historical_range_area_km2 = NA_real_,
+      area_status = "area_failed"
+    ))
+  }
+
+  g <- st_make_valid(g)
+
+  if (!inherits(g, c("sfc_POLYGON", "sfc_MULTIPOLYGON"))) {
+    g <- st_collection_extract(g, "POLYGON")
+  }
+
+  g <- g[!st_is_empty(g)]
+
+  if (length(g) == 0) {
+    return(data.frame(
+      sisid = id,
+      sci_name = x$sci_name[1],
+      historical_range_area_km2 = NA_real_,
+      area_status = "area_failed"
+    ))
+  }
+
+  data.frame(
+    sisid = id,
+    sci_name = x$sci_name[1],
+    historical_range_area_km2 =
+      as.numeric(st_area(g)) / 1e6,
+    area_status = "calculated"
+  )
+})
+
+result <- rbindlist(results, fill = TRUE)
+
+fwrite(
+  result,
+  file.path(
+    out_dir,
+    paste0("historical_range_size_", job_label, ".csv")
+  )
+)
