@@ -430,12 +430,14 @@ if (!length(mainland_overlapping_species_rows)) {
   mainland_area_hits <- bind_rows(mainland_chunk_area_results) %>%
     rename(mainland_area_km2 = area_km2)
 
+  mainland_nonoverlap_species_ids <- setdiff(
+    birds_species$sisid,
+    birds_species$sisid[mainland_overlapping_species_rows]
+  )
+
   mainland_area_absent <- data.frame(
-    sisid = setdiff(
-      birds_species$sisid,
-      birds_species$sisid[mainland_overlapping_species_rows]
-    ),
-    mainland_area_km2 = 0
+    sisid = mainland_nonoverlap_species_ids,
+    mainland_area_km2 = rep(0, length(mainland_nonoverlap_species_ids))
   )
 
   mainland_area <- bind_rows(
